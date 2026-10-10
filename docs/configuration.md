@@ -59,6 +59,8 @@ All optional.
 ## Host requirements
 
 - `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`: the committed arena is pinned and every grow is an `mlock()`, which checks the limit on hugetlb mappings too. HG warns at startup when the limit cannot cover growth, and a refused grow names the limit or the hugetlb pool, whichever ran out.
-- Optional hugetlb pool: `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in 2 MB pages. On the hugetlb tier the whole cap is reserved from the pool when the arena is created; a pool too small for the cap gives a fixed arena on huge pages instead of an elastic one, and says so.
+- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
+  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in 2 MB pages. On this tier the whole cap is reserved from the pool when the arena is created; a pool too small for the cap gives a fixed arena on huge pages instead of an elastic one, and says so.
+  - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
 
 More detail - every tier, the growth and shrink mechanics, deployment recipes, troubleshooting: [design.md](design.md).

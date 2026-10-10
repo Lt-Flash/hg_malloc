@@ -123,6 +123,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 
 1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required on every tier for an elastic arena.
 2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x workers`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late workers to THP.
+   **Tiers 2-3 instead of a pool:** THP `enabled` = `madvise` or `always` (private arenas) and `shmem_enabled` = `advise` or `always` (shared arena). With neither a pool nor THP, every arena runs on 4 KB pages.
 3. **Private caps multiply:** `-M 16:64` on 30 workers is up to 1.9 GB of potential pinned growth.
 4. **Tier 1 releases go back to the pool,** not to general memory; shrink `vm.nr_hugepages` to give them to the host.
 5. **Measuring the pool:** `HugePages_Free` alone also moves with private hugetlb use; the shared arena's pages are `(HugePages_Total - HugePages_Free) - sum of Private_Hugetlb over all processes`.

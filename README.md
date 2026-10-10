@@ -42,7 +42,21 @@ The service needs an unlimited memory-lock limit, because the committed arena is
 LimitMEMLOCK=infinity
 ```
 
-HG warns at startup, and under `opensips -C`, when the limit cannot cover the arena's growth. A hugetlb pool is optional; to use it, reserve enough 2 MB pages for the shared cap plus the private arenas (`vm.nr_hugepages`).
+HG warns at startup, and under `opensips -C`, when the limit cannot cover the arena's growth.
+
+**Enable huge pages on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
+
+```bash
+# Tier 1 - hugetlb pool: shm cap + pkg cap x processes, in 2 MB pages, ~12% margin.
+# e.g. -m 128:1024 -M 16:32 with 20 processes: (1024 + 32*20) / 2 = 832 pages, +12% = 932
+sysctl -w vm.nr_hugepages=932            # persist in /etc/sysctl.d/; reserve early, before memory fragments
+
+# Tiers 2-3 - transparent huge pages, used when there is no pool or it is too small
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled         # private arenas (-M)
+echo advise  > /sys/kernel/mm/transparent_hugepage/shmem_enabled   # shared arena (-m)
+```
+
+Many distributions ship `shmem_enabled` as `never`, which puts the shared arena on 4 KB pages even when THP is on for private memory. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later. The startup log names the tier each arena got, and the reason when it is 4 KB; `hg_stats` shows the split in `tier_bytes` when growth landed on more than one tier.
 
 Grow ahead of demand and give memory back with a profile - [configuration](docs/configuration.md):
 
