@@ -11,7 +11,7 @@ All figures from one OpenSIPS binary built from master plus HG_MALLOC. The alloc
 
 ## Setup
 
-- **Server:** 16-vCPU KVM guest (Xeon E5-2699 v4), Ubuntu 24.04, gcc 13, kernel 6.8. virtio NIC with 16 queues, 8 MB UDP socket buffers, `maxbuffer` 8 MB, a hugetlb pool large enough for the caps, `LimitMEMLOCK` unlimited.
+- **Server:** 16-vCPU KVM guest (Xeon E5-2699 v4), Ubuntu 24.04, gcc 13, kernel 6.8. virtio NIC with 16 queues, 8 MB UDP socket buffers, `maxbuffer` 8 MB, a hugetlb pool large enough for the caps, `LimitMEMLOCK` unlimited. HG_MALLOC ran on that pool (tier 1, shared and private arenas, confirmed from `core:hg_stats`) in every table except [Backing tiers](#backing-tiers); the other allocators do not use huge pages and ran on plain 4 KB pages.
 - **Load:** sipp, up to 60 instances split evenly over two other 16-vCPU hosts with 16-queue NICs on the same LAN, 1,000-2,000 calls per second each.
 - **CPU:** user plus system time of every OpenSIPS process over a fixed window while the load runs.
 - **Latency:** sipp's per-call response times, plus a separate probe sending 100 requests per second and timing each round trip in microseconds.
