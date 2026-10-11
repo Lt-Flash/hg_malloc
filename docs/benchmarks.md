@@ -75,6 +75,21 @@ Straight after it, the same point with 32 MB socket buffers: `maxbuffer` and `rm
 
 Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the difference is within their run-to-run spread - so their workers stall for longer than 32 MB of queue covers. F_PARALLEL_MALLOC, which dropped only 2,998 with 8 MB, dropped none; one of its probe INVITEs still took 554 ms. HG_MALLOC dropped none on the server either way; with 32 MB, one client host retransmitted 3,342 times and two probe INVITEs timed out while the server's receive and send error counters stayed at zero.
 
+## Backing tiers
+
+HG_MALLOC alone at 60,000 on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every table on this page.
+
+| tier | OpenSIPS CPU, cores | host idle | UDP drops | INVITE p99 (probe) |
+|---|---|---|---|---|
+| 1 - hugetlb pool | **4.27** | 71% | 0 | **1.9 ms** |
+| 2 - THP by advice | 4.47 | 71% | 0 | 2.3 ms |
+| 3 - THP by collapse | 4.81 | 65% | 0 | 6.6 ms |
+| 4 - plain 4 KB | 4.90 | 67% | 0 | 4.0 ms |
+
+Huge pages are worth about 13% of the CPU and half the p99 at this rate; on plain 4 KB pages, like the other allocators, HG_MALLOC still needs 4-14% less CPU than they do (5.12-5.69 cores, mpstat run above) and drops nothing.
+
+Tier 3 first ran with the `MADV_COLLAPSE` retrofit inside each grow: 36 ms per 16 MB step instead of about 5 ms, paid by the worker that ran out of memory while others waited for it, and 107,524 UDP drops - all in the first 18 s, while the arena grew from 128 MB to 1.3 GB. Such a step now publishes its pages on 4 KB at once and the maintenance process collapses them afterwards: 0 drops, with all 664 pages collapsed about 38 s into the load. Until then that memory runs on 4 KB pages, which is why the tier 3 row above sits next to tier 4; once collapsed it is the same memory as tier 2.
+
 ## Memory under load
 
 Peak shared memory in the INVITE runs above, with the UDP drops of the same run:

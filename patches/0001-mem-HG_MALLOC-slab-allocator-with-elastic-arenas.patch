@@ -1,4 +1,4 @@
-From 6bd3352a09fcfbdfe31729690ba0adc433f33663 Mon Sep 17 00:00:00 2001
+From 6642c73b70548b4adb38a4249e4b3cc427f8efb8 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - slab allocator with elastic arenas
@@ -18,6 +18,9 @@ existing configurations.
  - The arena is acquired through a four-tier ladder - MAP_HUGETLB, THP via
    MADV_HUGEPAGE, MADV_COLLAPSE, plain 4 KB pages - each tier verified from
    the kernel's counters. Huge pages are an optimisation, not a requirement.
+   On tier 3 a grow done by a worker that ran out of memory is published on
+   4 KB pages at once and the maintenance process collapses it afterwards,
+   so no worker waits for MADV_COLLAPSE.
  - Elastic arenas: -m INIT:CAP / -M INIT:CAP (k/m/g suffixes, bare numbers
    in MB) reserve the cap and commit pages on demand, in a configurable
    granule (shm_grow_granule / pkg_grow_granule), growing on exhaustion or
@@ -79,14 +82,14 @@ procedures: mem/README.hg_malloc.md.
  mem/common.h                |   27 +-
  mem/hg_arena.c              | 2411 +++++++++++++++++++++++++++++++++++
  mem/hg_arena.h              |  136 ++
- mem/hg_buddy.c              | 1651 ++++++++++++++++++++++++
- mem/hg_buddy.h              |  249 ++++
+ mem/hg_buddy.c              | 1720 +++++++++++++++++++++++++
+ mem/hg_buddy.h              |  253 ++++
  mem/hg_large.c              |  430 +++++++
  mem/hg_large.h              |  102 ++
- mem/hg_maint.c              |  213 ++++
+ mem/hg_maint.c              |  216 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 2214 ++++++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1584 +++++++++++++++++++++++
+ mem/hg_malloc.c             | 2247 ++++++++++++++++++++++++++++++++
+ mem/hg_malloc.h             | 1596 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -94,7 +97,7 @@ procedures: mem/README.hg_malloc.md.
  mem/mem_arena.h             |  125 ++
  mem/shm_mem.c               |  160 ++-
  mem/shm_mem.h               |   45 +-
- mi/mi_core.c                |  731 +++++++++++
+ mi/mi_core.c                |  738 +++++++++++
  modules/hgstress/Makefile   |    9 +
  modules/hgstress/hgstress.c |  576 +++++++++
  opensips.8                  |   33 +-
@@ -104,7 +107,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 42 files changed, 12261 insertions(+), 39 deletions(-)
+ 42 files changed, 12389 insertions(+), 39 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1064,7 +1067,7 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..e4c37fc110
+index 0000000000..062e69a105
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
 @@ -0,0 +1,344 @@
@@ -1099,7 +1102,7 @@ index 0000000000..e4c37fc110
 +
 +Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and says why when THP is turned off by a host setting. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
 +
-+**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
++**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes. On tier 3 a step taken by a worker that ran out of memory is published on 4 KB pages at once and collapsed by the maintenance process afterwards - one page at a time, with the arena lock released, for up to 50 ms a second - so the worker never waits for `MADV_COLLAPSE` (about 36 ms per 16 MB step); a step taken ahead of demand collapses straight away. `core:hg_stats` counts these pages as `collapse_deferred`, `collapsed_late` and `collapse_late_failed`.
 +
 +**Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). If the pool can hold the initial size but not the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup. If it cannot hold even the initial size, the arena starts on THP with its full cap and stays elastic.
 +
@@ -4082,10 +4085,10 @@ index 0000000000..8e6bd4f09d
 +#endif /* hg_arena_h */
 diff --git a/mem/hg_buddy.c b/mem/hg_buddy.c
 new file mode 100644
-index 0000000000..18fab7fd31
+index 0000000000..d713b6fc5e
 --- /dev/null
 +++ b/mem/hg_buddy.c
-@@ -0,0 +1,1651 @@
+@@ -0,0 +1,1720 @@
 +/*
 + * buddy allocator over the HG_MALLOC page grid
 + *
@@ -4599,11 +4602,69 @@ index 0000000000..18fab7fd31
 +static int hg_buddy_regrow_holes(struct hg_block *hb, unsigned long need,
 +                                 unsigned long room);
 +
++/*
++ * Deferred collapse. A grow done by a worker on exhaustion publishes a delta
++ * that did not come out huge at fault on 4 KB pages, flagged want_collapse
++ * (hg_mem_commit()), so the worker is not held for the MADV_COLLAPSE
++ * retrofit. The maintenance process calls this every tick: it collapses
++ * the flagged pages one at a time with the arena lock released, for up to
++ * HG_COLLAPSE_BUDGET_NS per tick, and moves each page's bytes from the 4 KB
++ * tier to tier 3 when the kernel's counter confirms it. Pages are only
++ * released by this same process (shrink, drain, punch), so a page picked
++ * here cannot be released under it.
++ */
++#define HG_COLLAPSE_BUDGET_NS	(50UL * 1000000UL)
++
++void hg_collapse_deferred(struct hg_block *hb)
++{
++	unsigned long start = hg_now_ns(), i;
++	struct hg_page *pg;
++	int ok;
++
++	if (!__atomic_load_n(&hb->collapse_pending, __ATOMIC_ACQUIRE))
++		return;
++	while (hg_now_ns() - start < HG_COLLAPSE_BUDGET_NS) {
++		hg_lock_enter(hb, HG_LK_POLICY);
++		pg = NULL;
++		for (i = hb->collapse_scan; i < hb->npages; i++)
++			if (hb->pages[i].want_collapse && !hb->pages[i].releasing &&
++			    !hb->pages[i].punched) {
++				pg = &hb->pages[i];
++				break;
++			}
++		if (!pg) {
++			hb->collapse_scan = 0;
++			hb->collapse_pending = 0;
++			hg_lock_leave(hb);
++			return;
++		}
++		pg->want_collapse = 0;
++		hb->collapse_scan = i + 1;
++		hg_lock_leave(hb);
++
++		ok = hg_mem_collapse(hb, pg->base, hb->hps);
++
++		hg_lock_enter(hb, HG_LK_POLICY);
++		if (ok) {
++			if (pg->tier == HG_MEM_4K) {
++				if (hb->tier_bytes[HG_MEM_4K] >= hb->hps)
++					hb->tier_bytes[HG_MEM_4K] -= hb->hps;
++				hb->tier_bytes[HG_MEM_THP_COLLAPSE] += hb->hps;
++				pg->tier = HG_MEM_THP_COLLAPSE;
++			}
++			hb->collapsed_late++;
++		} else {
++			hb->collapse_late_failed++;
++		}
++		hg_lock_leave(hb);
++	}
++}
++
 +int hg_buddy_grow(struct hg_block *hb, unsigned long need, enum hg_grow_why why)
 +{
 +	unsigned long delta, room, old_pages, i, limit, t0, off, commit_ns;
 +	unsigned long cp_ns[HG_CP_PHASES];
-+	int tier, reason;
++	int tier, reason, later;
 +
 +	if (!hb->buddy_ready)
 +		return -1;
@@ -4727,7 +4788,11 @@ index 0000000000..18fab7fd31
 +	 * pin and the backing verification (tens of ms for 16 MB) no longer
 +	 * stall every other slow path in the arena */
 +	t0 = hg_now_ns();
-+	tier = hg_mem_commit(hb, off, delta, cp_ns);
++	later = 0;
++	tier = hg_mem_commit(hb, off, delta, cp_ns,
++		(why == HG_GROW_EXHAUSTION && hb->shared &&
++		 __atomic_load_n(&hb->maint_active, __ATOMIC_ACQUIRE)) ?
++		&later : NULL);
 +	commit_ns = hg_now_ns() - t0;
 +
 +	/* phase 3 - PUBLISH under the lock */
@@ -4758,7 +4823,12 @@ index 0000000000..18fab7fd31
 +
 +	for (i = old_pages; i < hb->npages; i++) {
 +		hb->pages[i].tier = (unsigned char)tier;
++		hb->pages[i].want_collapse = (unsigned char)later;
 +		page_publish_whole(hb, &hb->pages[i]);
++	}
++	if (later) {
++		hb->collapse_deferred += hb->npages - old_pages;
++		__atomic_store_n(&hb->collapse_pending, 1, __ATOMIC_RELEASE);
 +	}
 +	/* the published sizes move last, with release semantics: a waiter
 +	 * polling committed_bytes lock-free, or hg_owns() reading span_end on
@@ -4930,6 +5000,7 @@ index 0000000000..18fab7fd31
 +			if (hb->tier_bytes[pg->tier] >= hb->hps)
 +				hb->tier_bytes[pg->tier] -= hb->hps;
 +		}
++		pg->want_collapse = 0;     /* released: nothing left to collapse */
 +	}
 +	hb->npages -= n;
 +	hb->span_end -= len;
@@ -5058,6 +5129,7 @@ index 0000000000..18fab7fd31
 +		hb->punched_pages++;
 +		if (hb->tier_bytes[pg->tier] >= hb->hps)
 +			hb->tier_bytes[pg->tier] -= hb->hps;
++		pg->want_collapse = 0;     /* punched: nothing left to collapse */
 +	}
 +	if (ok) {
 +		floor_recompute(hb);
@@ -5739,10 +5811,10 @@ index 0000000000..18fab7fd31
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_buddy.h b/mem/hg_buddy.h
 new file mode 100644
-index 0000000000..a3a9fcaa49
+index 0000000000..6d989f27bc
 --- /dev/null
 +++ b/mem/hg_buddy.h
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,253 @@
 +/*
 + * buddy allocator over the HG_MALLOC page grid
 + *
@@ -5855,6 +5927,10 @@ index 0000000000..a3a9fcaa49
 +	 * taking the page off the free list and finishing its bookkeeping;
 +	 * every scan that reads the bitmap rather than the list must skip it */
 +	unsigned char releasing;
++	/* published on 4 KB by a worker's grow that skipped the MADV_COLLAPSE
++	 * retrofit; the maintenance process collapses it (hg_collapse_deferred).
++	 * Fits the existing padding; the descriptor stays 56 bytes. */
++	unsigned char want_collapse;
 +};
 +
 +/* run_len marker for a page that belongs to a run but does not head it */
@@ -6538,10 +6614,10 @@ index 0000000000..fbe3dc60e3
 +#endif /* hg_large_h */
 diff --git a/mem/hg_maint.c b/mem/hg_maint.c
 new file mode 100644
-index 0000000000..05fe3eae50
+index 0000000000..882f5dae49
 --- /dev/null
 +++ b/mem/hg_maint.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,216 @@
 +/*
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -6668,6 +6744,9 @@ index 0000000000..05fe3eae50
 +			hg_drain_tick(hb);   /* the decision's execution */
 +		}
 +		hg_lock_leave(hb);
++		/* pages a worker's grow left on 4 KB - collapsed here, where
++		 * nobody waits for it; takes the lock per page itself */
++		hg_collapse_deferred(hb);
 +	}
 +}
 +
@@ -6802,10 +6881,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..56ff2ab144
+index 0000000000..ca204412ad
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,2214 @@
+@@ -0,0 +1,2247 @@
 +/*
 + * slab allocator with elastic arenas
 + *
@@ -7526,6 +7605,29 @@ index 0000000000..56ff2ab144
 +}
 +
 +/*
++ * MADV_COLLAPSE one already-committed range and verify it from the kernel's
++ * counter, as init does: 1 when it is now on huge pages. For the deferred
++ * collapse (hg_collapse_deferred() in hg_buddy.c), which owns the page
++ * bookkeeping; the counter helpers live here.
++ */
++int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len)
++{
++#ifdef __OS_linux
++	long before, after;
++
++	if (hg_thp_collapse_denied(hb->shared))
++		return 0;
++	before = hg_read_huge_kb(hb->shared);
++	if (before < 0 || madvise(base, len, MADV_COLLAPSE) != 0)
++		return 0;
++	after = hg_read_huge_kb(hb->shared);
++	return after - before >= (long)(len >> 10);
++#else
++	return 0;
++#endif
++}
++
++/*
 + * The live peak (live_peak, shmem:max_used_size) is a high-water mark taken
 + * when the figure is computed. Refreshed only by statistics reads, it missed
 + * any load that nobody was reading during: measured 4 MB reported after a
@@ -7822,7 +7924,7 @@ index 0000000000..56ff2ab144
 +	} while (0)
 +
 +int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
-+		unsigned long cp_ns[HG_CP_PHASES])
++		unsigned long cp_ns[HG_CP_PHASES], int *collapse_later)
 +{
 +	char *base = hb->hbase + off;
 +	int mlock_rc, is_huge, collapsed, i;
@@ -7920,6 +8022,16 @@ index 0000000000..56ff2ab144
 +			hg_read_huge_kb(hb->shared), delta));
 +		if (is_huge)
 +			return HG_MEM_THP_ADVISE;
++		/* a worker that ran out of memory is waiting on this grow, and
++		 * the retrofit is ~4.5 ms per 2 MB page - measured 36 ms per
++		 * 16 MB grow, 107k UDP drops at 60k cps while the arena grew.
++		 * Publish the delta on 4 KB pages now; the maintenance process
++		 * collapses it with nobody waiting (hg_collapse_deferred) */
++		if (collapse_later && shmem_kb >= 0 &&
++		    !hg_thp_collapse_denied(hb->shared)) {
++			*collapse_later = 1;
++			return HG_MEM_4K;
++		}
 +		HG_CP_TIME(HG_CP_COLLAPSE,
 +			collapsed = shmem_kb >= 0 &&
 +			    !hg_thp_collapse_denied(hb->shared) &&
@@ -9022,10 +9134,10 @@ index 0000000000..56ff2ab144
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..2bf9e035fd
+index 0000000000..50b1edae59
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1584 @@
+@@ -0,0 +1,1596 @@
 +/*
 + * slab allocator with elastic arenas
 + *
@@ -9783,6 +9895,13 @@ index 0000000000..2bf9e035fd
 +	 * request */
 +	unsigned long         grows_proactive;
 +	unsigned long         grows_exhaustion;
++	/* deferred collapse (tier 3): pages a worker's grow published on 4 KB
++	 * for the maintenance process to collapse - see hg_collapse_deferred() */
++	unsigned int          collapse_pending;
++	unsigned long         collapse_scan;          /* next page to look at */
++	unsigned long         collapse_deferred;      /* pages handed over */
++	unsigned long         collapsed_late;         /* pages it collapsed */
++	unsigned long         collapse_late_failed;   /* pages left on 4 KB */
 +	/*
 +	 * The alertable grow-blocked state, RESOURCE refusals only - an admin
 +	 * cap doing its job is policy, not an incident, and never latches.
@@ -10044,9 +10163,14 @@ index 0000000000..2bf9e035fd
 + * backing (and retrofit huge pages where the host needs it). Called WITHOUT
 + * hb->lock held: it touches no allocator state except the locked_mb
 + * total (atomically) and the once-per-episode refusal flag; the phase
-+ * timings come back in @cp_ns for the caller to merge under the lock. */
++ * timings come back in @cp_ns for the caller to merge under the lock.
++ * @collapse_later non-NULL: a worker is waiting on this grow, so a delta that
++ * needs the MADV_COLLAPSE retrofit is published on 4 KB pages instead and
++ * *collapse_later is set - hg_collapse_deferred() collapses it afterwards. */
 +int hg_mem_commit(struct hg_block *hb, unsigned long off, unsigned long delta,
-+		unsigned long cp_ns[HG_CP_PHASES]);
++		unsigned long cp_ns[HG_CP_PHASES], int *collapse_later);
++int hg_mem_collapse(struct hg_block *hb, char *base, unsigned long len);
++void hg_collapse_deferred(struct hg_block *hb);
 +
 +/*
 + * The host-RAM limb of the growth ceiling: would committing @delta more
@@ -11472,7 +11596,7 @@ index deaecc106a..b08bc59663 100644
  #if defined F_MALLOC || defined Q_MALLOC
  		|| mem_lock
 diff --git a/mi/mi_core.c b/mi/mi_core.c
-index ce49333672..feb6f44fb4 100644
+index ce49333672..7192422d25 100644
 --- a/mi/mi_core.c
 +++ b/mi/mi_core.c
 @@ -44,6 +44,11 @@
@@ -11495,7 +11619,7 @@ index ce49333672..feb6f44fb4 100644
  	}
  
  	return resp;
-@@ -982,6 +988,717 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
+@@ -982,6 +988,724 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
  
  
  
@@ -11702,6 +11826,13 @@ index ce49333672..feb6f44fb4 100644
 +	if (add_mi_number(o, MI_SSTR("grows_proactive"), hb->grows_proactive) < 0)
 +		return -1;
 +	if (add_mi_number(o, MI_SSTR("grows_exhaustion"), hb->grows_exhaustion) < 0)
++		return -1;
++	/* tier 3: pages a worker's grow published on 4 KB, and what the
++	 * maintenance process made of them (hg_collapse_deferred) */
++	if (add_mi_number(o, MI_SSTR("collapse_deferred"), hb->collapse_deferred) < 0 ||
++	    add_mi_number(o, MI_SSTR("collapsed_late"), hb->collapsed_late) < 0 ||
++	    add_mi_number(o, MI_SSTR("collapse_late_failed"),
++	        hb->collapse_late_failed) < 0)
 +		return -1;
 +	/* the two-phase commit's state and the waits it caused */
 +	if (add_mi_number(o, MI_SSTR("grow_inflight"), hb->grow_inflight) < 0)
@@ -12213,7 +12344,7 @@ index ce49333672..feb6f44fb4 100644
  static const mi_export_t mi_core_cmds[] = {
  	{ "pi_list", "lists the provisioning framework", 0, 0, {
  		{w_mi_pi_list, {0}},
-@@ -1005,6 +1722,20 @@ static const mi_export_t mi_core_cmds[] = {
+@@ -1005,6 +1729,20 @@ static const mi_export_t mi_core_cmds[] = {
  		{mi_pwd, {0}},
  		{EMPTY_MI_RECIPE}}, {0}
  	},
