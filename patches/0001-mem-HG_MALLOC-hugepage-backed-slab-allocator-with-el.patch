@@ -1,4 +1,4 @@
-From 013bd4a2e5b04fd5a198a96996434c7e596a96fd Mon Sep 17 00:00:00 2001
+From 66f9acedd43aca789e7271c0224dadf05ca67424 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -70,7 +70,7 @@ procedures: mem/README.hg_malloc.md.
  globals.h                   |   25 +
  help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc.md     |  340 +++++
+ mem/README.hg_malloc.md     |  341 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
  mem/hg_arena.c              | 2346 +++++++++++++++++++++++++++++++++++
@@ -99,7 +99,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11949 insertions(+), 38 deletions(-)
+ 41 files changed, 11950 insertions(+), 38 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1056,10 +1056,10 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..dcda99d1aa
+index 0000000000..eace5c96dd
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,341 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
@@ -1388,9 +1388,10 @@ index 0000000000..dcda99d1aa
 +
 +### Host memory checks
 +
-+Every process creates its own private arena and commits its `-M` INIT at once, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`.
++The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 +
-+- **Startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
++- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED).
++- **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 +- **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 +- **Every arena:** an INIT the host cannot hold is refused when the arena is created.
 +- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process.

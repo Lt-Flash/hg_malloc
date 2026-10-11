@@ -165,9 +165,10 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 
 ## Host memory checks
 
-Every process creates its own private arena and commits its `-M` INIT at once, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`.
+The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 
-- **Startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
+- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED).
+- **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 - **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 - **Every arena:** an INIT the host cannot hold is refused when the arena is created.
 - **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process.
