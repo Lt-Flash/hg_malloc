@@ -24,15 +24,13 @@ The full design, with measurements behind each decision: [docs/design.md](docs/d
 
 ## Code
 
-- **Branch:** [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) on the Lt-Flash/opensips fork - current OpenSIPS master plus two commits; clone and build it as any OpenSIPS tree.
-- **Patches:** [`patches/`](patches) - the same two commits as `git format-patch` output, against OpenSIPS master [`6832fe4e66`](https://github.com/OpenSIPS/opensips/commit/6832fe4e66):
-  1. `0001` - the allocator: `mem/hg_*`, the elastic-arena and autoscaling configuration, `hg_stats` and the events.
-  2. `0002` - `modules/hgstress`, a multi-process soak and fault-injection module (excluded from the default build).
+- **Branch:** [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) on the Lt-Flash/opensips fork - current OpenSIPS master plus one commit; clone and build it as any OpenSIPS tree. Proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327).
+- **Patch:** [`patches/`](patches) - the same commit as `git format-patch` output, against OpenSIPS master [`6832fe4e66`](https://github.com/OpenSIPS/opensips/commit/6832fe4e66): the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build.
 
 ```bash
 git clone https://github.com/OpenSIPS/opensips && cd opensips
 git checkout 6832fe4e66
-git am /path/to/hg_malloc/patches/*.patch
+git am /path/to/hg_malloc/patches/0001-*.patch
 ```
 
 ## Quick start
@@ -99,4 +97,4 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Status
 
-Not yet in upstream OpenSIPS; it will be proposed for inclusion. Available as a branch and as patches (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.
+Not yet in upstream OpenSIPS. Proposed as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327); available as a branch and as a patch (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.
