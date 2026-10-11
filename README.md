@@ -8,17 +8,17 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 - **No drops under load:** 0 UDP drops at 60k cps, where every other allocator drops 160,000 or more; the workers keep the socket drained.
 - **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 11-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
-- **Safe and observable:** double frees and corrupted free lists are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
-- **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; tested on x86 and ARM, 32-bit and 64-bit, glibc and musl.
+- **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
+- **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
 Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchmarks](docs/benchmarks.md). In production on 11 SIP nodes (SBCs and registrars) since October 2026.
 
 ## How it works
 
 - **Lock-free common path.** 21 size classes from 64 B to 64 KB, served from a private free list per process: an allocation and the free that returns it take no lock and touch no shared cache line. Cells move between processes through a shared per-class pool, in batches.
-- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator inside each 2 MB page; a block whose cells are all free returns to the buddy and can be re-cut for any size class.
+- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator inside each huge page (2 MB on x86-64); a block whose cells are all free returns to the buddy and can be re-cut for any size class.
 - **Huge pages when available.** The arena is acquired through a four-step ladder - `MAP_HUGETLB`, transparent huge pages by advice, by collapse, then plain 4 KB pages - each tier verified from the kernel's own counters.
-- **Elastic arenas.** `-m INIT:CAP` reserves the cap and commits pages only as needed; a maintenance process grows ahead of demand and releases quiet pages with the arena lock dropped. Growth stops at the cap, at what the backing tier can give, and at a floor of host free memory - and a sustained refusal raises an alertable event.
+- **Elastic arenas.** `-m INIT:CAP` reserves the cap and commits pages only as needed; a maintenance process grows ahead of demand and releases quiet pages with the arena lock dropped. Growth stops at the cap, at what the backing tier can give, and at a floor of host free memory - and when the backing or host memory keeps refusing, an alertable event is raised.
 
 The full design, with measurements behind each decision: [docs/design.md](docs/design.md).
 
@@ -67,7 +67,7 @@ echo madvise > /sys/kernel/mm/transparent_hugepage/enabled         # private are
 echo advise  > /sys/kernel/mm/transparent_hugepage/shmem_enabled   # shared arena (-m)
 ```
 
-Many distributions ship `shmem_enabled` as `never`, which puts the shared arena on 4 KB pages even when THP is on for private memory. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later. The startup log names the tier each arena got, and the reason when it is 4 KB; `hg_stats` shows the split in `tier_bytes` when growth landed on more than one tier.
+Many distributions ship `shmem_enabled` as `never`, which puts the shared arena on 4 KB pages even when THP is on for private memory. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later. The startup log names the tier each arena got, and, when THP is off by a host setting, why it fell to 4 KB pages; `hg_stats` shows the split in `tier_bytes` when growth landed on more than one tier.
 
 Grow ahead of demand and give memory back with a profile - [configuration](docs/configuration.md):
 
@@ -91,7 +91,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Costs
 
-- About 30% more shared memory per stored object than F_MALLOC, from size-class rounding.
+- Memory: about the same as F_MALLOC for registrations (+2% live memory, measured on 400k contacts); more for workloads dominated by 1-4 KB objects, from size-class rounding.
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers are Linux-only; elsewhere the arena is plain pinned memory.
 

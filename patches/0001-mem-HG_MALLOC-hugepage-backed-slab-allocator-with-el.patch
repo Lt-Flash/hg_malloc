@@ -1,19 +1,20 @@
-From 2223704c860dcee35da820e556e2f500ff49db37 Mon Sep 17 00:00:00 2001
+From 77cf79d53ecbb74d36c92391469d588dd7a37bc6 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
  arenas
 
 A new shared- and private-memory allocator, selected at runtime with
--a HG_MALLOC (or -s/-k); nothing changes without it.
+-a HG_MALLOC (or -s/-k for one memory type); no behaviour change for
+existing configurations.
 
  - 21 size classes (64 B - 64 KB) served from per-process free lists, so
    the common allocation and free take no lock; cells move between
    processes through a shared per-class pool, in batches. Larger requests
    go to a coalescing large tier.
- - Blocks are carved from a buddy allocator inside each 2 MB page; a block
-   whose cells are all free returns to the buddy and can be re-cut for any
-   class.
+ - Blocks are carved from a buddy allocator inside each huge page (2 MB
+   on x86-64); a block whose cells are all free returns to the buddy and
+   can be re-cut for any class.
  - The arena is acquired through a four-step ladder - MAP_HUGETLB, THP via
    MADV_HUGEPAGE, MADV_COLLAPSE, plain 4 KB pages - each tier verified from
    the kernel's counters. Huge pages are an optimisation, not a requirement.
@@ -24,7 +25,8 @@ A new shared- and private-memory allocator, selected at runtime with
    and releasing quiet pages. A maintenance process grows ahead of demand and
    runs the release with the arena lock dropped. Growth stops at the cap,
    the backing tier and a host free-memory floor (hg_ram_floor_mb); a
-   sustained refusal latches GROW-BLOCKED, raised as E_CORE_SHM_GROW_BLOCKED.
+   sustained refusal by the backing or the floor latches GROW-BLOCKED,
+   raised as E_CORE_SHM_GROW_BLOCKED (reaching the cap is only a notice).
  - Every grow is an mlock() of the new range, and mlock() checks
    RLIMIT_MEMLOCK on hugetlb as well: the arena warns at startup (and under
    -C) when the limit cannot cover its growth, and a refused grow names the
@@ -34,11 +36,12 @@ A new shared- and private-memory allocator, selected at runtime with
    corruption counters; core:hg_advise (MI) recommends -m/-M from the peaks
    reached; an hgmem: statistics group; E_CORE_HG_LOCK_STALL for a hold
    above hg_lock_stall_us.
- - A per-block free map at the pool boundary makes a double free exact and
-   stops a free-list walk at a scribbled link; both are counted and logged
-   and the process keeps running.
+ - A per-block free map at the pool boundary catches a double free when
+   it reaches the shared pool and stops a free-list walk at a scribbled
+   link; both are counted and logged and the process keeps running.
  - mem/mem_arena.h: a module may ask for its own HG-managed arena,
-   independent of the core allocator choice (stubs when HG is not built).
+   independent of the core allocator choice (stubs returning NULL when HG
+   is not built).
  - modules/hgstress: a soak and fault-injection test module, excluded from
    the default build. Every worker churns stamped shm cells across all
    classes and the large tier and verifies the stamps while the others
@@ -47,35 +50,35 @@ A new shared- and private-memory allocator, selected at runtime with
 
 Builds clean with gcc and clang -Werror, with HG_MALLOC compiled out, on
 arm32/arm64, i386 and musl. Design, configuration, deployment and test
-procedures: mem/README.hg_malloc_v3.md.
+procedures: mem/README.hg_malloc.md.
 ---
  Makefile.conf.template      |    8 +-
  Makefile.defs               |    3 +
  cfg.lex                     |   33 +
  cfg.y                       |  161 ++-
- core_stats.c                |  306 +++++
+ core_stats.c                |  305 +++++
  core_stats.h                |   21 +
  evi/evi_core.c              |    7 +
  evi/evi_core.h              |    8 +
  globals.c                   |   23 +
  globals.h                   |   25 +
- help_msg.h                  |    1 +
+ help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc_v3.md  |  214 ++++
- mem/common.c                |   23 +
+ mem/README.hg_malloc.md     |  312 +++++
+ mem/common.c                |   14 +
  mem/common.h                |   27 +-
- mem/hg_arena.c              | 2348 +++++++++++++++++++++++++++++++++++
- mem/hg_arena.h              |  143 +++
+ mem/hg_arena.c              | 2346 +++++++++++++++++++++++++++++++++++
+ mem/hg_arena.h              |  136 ++
  mem/hg_buddy.c              | 1649 ++++++++++++++++++++++++
  mem/hg_buddy.h              |  249 ++++
  mem/hg_large.c              |  426 +++++++
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 1828 +++++++++++++++++++++++++++
+ mem/hg_malloc.c             | 1830 +++++++++++++++++++++++++++
  mem/hg_malloc.h             | 1516 ++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
- mem/hg_version.h            |   39 +
+ mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
  mem/mem.h                   |   12 +
  mem/mem_arena.h             |  125 ++
@@ -90,8 +93,8 @@ procedures: mem/README.hg_malloc_v3.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11572 insertions(+), 36 deletions(-)
- create mode 100644 mem/README.hg_malloc_v3.md
+ 41 files changed, 11650 insertions(+), 38 deletions(-)
+ create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
  create mode 100644 mem/hg_buddy.c
@@ -109,7 +112,7 @@ procedures: mem/README.hg_malloc_v3.md.
  create mode 100644 modules/hgstress/hgstress.c
 
 diff --git a/Makefile.conf.template b/Makefile.conf.template
-index c6396cc5f4..ac68c8cc39 100644
+index c6396cc5f4..0d6f8b5519 100644
 --- a/Makefile.conf.template
 +++ b/Makefile.conf.template
 @@ -76,7 +76,7 @@
@@ -130,7 +133,7 @@ index c6396cc5f4..ac68c8cc39 100644
 +# start at 128 MB, grow on demand up to 1 GB, give memory back when idle.
 +# Uses huge pages when the host has them (hugetlb pool or THP), else 4 KB
 +# pages. The committed arena is mlock()ed: run with LimitMEMLOCK=infinity.
-+# See mem/README.hg_malloc_v3.md
++# See mem/README.hg_malloc.md
  #DEFS+= -DQM_DBG_MALLOC_HIST=3 #Size of debug history for Q_MALLOC (default is 1)
  #DEFS+= -DNO_DEBUG #Compile out all debug messages
  #DEFS+= -DNO_LOG #Compile out all logging
@@ -423,10 +426,10 @@ index 5647ac79ea..172955ee9e 100644
  				auto_scaling_cycle=$3; }
  		| AUTO_SCALING_CYCLE EQUAL error {
 diff --git a/core_stats.c b/core_stats.c
-index 739a520700..e6196745f8 100644
+index 739a520700..5042ba62d9 100644
 --- a/core_stats.c
 +++ b/core_stats.c
-@@ -186,6 +186,307 @@ static unsigned long get_pkg_fragments( void*proc_id)
+@@ -186,6 +186,306 @@ static unsigned long get_pkg_fragments( void*proc_id)
  	return pkg_status[(unsigned long)proc_id][PKG_FRAGMENTS_SIZE_IDX];
  }
  
@@ -575,10 +578,9 @@ index 739a520700..e6196745f8 100644
 +		LM_ERR("unable to raise the lock-stall event\n");
 +}
 +
-+static void hg_grow_blocked_event(void)
++static void hg_grow_blocked_event(unsigned int ticks)
 +{
 +	struct hg_block *hb = (struct hg_block *)shm_block;
-+	static unsigned int blocked_sweeps;
 +	evi_params_p list;
 +	int due, committed_mb, cap_mb, refused;
 +	unsigned int stall_due;
@@ -586,7 +588,10 @@ index 739a520700..e6196745f8 100644
 +	int stall_reason, stall_proc;
 +	str arena = str_init("shm");
 +
-+	if (!hb)
++	/* the sweep also runs for -k HG_MALLOC alone, where shm_block
++	 * belongs to another allocator */
++	if (!hb || (mem_allocator_shm != MM_HG_MALLOC &&
++	            mem_allocator_shm != MM_HG_MALLOC_DBG))
 +		return;
 +
 +	/* consume the due flag and sample the numbers under the lock; the
@@ -605,14 +610,11 @@ index 739a520700..e6196745f8 100644
 +	}
 +	due = hb->grow_event_due;
 +	hb->grow_event_due = 0;
++	/* keyed on the timer's tick, not a counter: timer jobs run in
++	 * whichever process reads the timer pipe, each with its own statics */
 +	if (!due && hb->grow_blocked &&
-+	    ++blocked_sweeps >= HG_GROW_REWARN_SWEEPS) {
++	    (ticks / HG_SWEEP_INTERVAL) % HG_GROW_REWARN_SWEEPS == 0)
 +		due = 1;                     /* still blocked - re-warn */
-+	}
-+	if (due)
-+		blocked_sweeps = 0;
-+	if (!hb->grow_blocked)
-+		blocked_sweeps = 0;
 +	committed_mb = (int)(hb->committed_bytes >> 20);
 +	cap_mb       = (int)(hb->hcap >> 20);
 +	refused      = (int)hb->grow_refused;
@@ -672,7 +674,7 @@ index 739a520700..e6196745f8 100644
 +	int i, n = counted_max_processes;
 +
 +	if (slot == 0) {
-+		hg_grow_blocked_event();
++		hg_grow_blocked_event(ticks);
 +
 +		/*
 +		 * Publish the sweep to threads IPC cannot reach BEFORE dispatching
@@ -734,7 +736,7 @@ index 739a520700..e6196745f8 100644
  
  int init_pkg_stats(int procs_no)
  {
-@@ -328,3 +629,8 @@ int init_pkg_stats(int procs_no)
+@@ -328,3 +628,8 @@ int init_pkg_stats(int procs_no)
  #endif /* PKG */
  
  #endif /* STATISTICS */
@@ -885,10 +887,10 @@ index d818518cf4..f14fe1a152 100644
  
  /* TCP network layer related parameters */
 diff --git a/help_msg.h b/help_msg.h
-index 7eb4544e51..c9c9f42e45 100644
+index 7eb4544e51..04c66ef2a3 100644
 --- a/help_msg.h
 +++ b/help_msg.h
-@@ -96,6 +96,7 @@ Options:\n\
+@@ -96,11 +96,13 @@ Options:\n\
                        F_PARALLEL_MALLOC   F_PARALLEL_MALLOC_DBG\n\
                        Q_MALLOC            Q_MALLOC_DBG\n\
                        HP_MALLOC           HP_MALLOC_DBG\n\
@@ -896,6 +898,14 @@ index 7eb4544e51..c9c9f42e45 100644
      -k allocator The pkg memory allocator to use (overrides -a)\n\
      -s allocator The shared memory allocator to use (overrides -a)\n\
      -e allocator The restart-persistent memory allocator to use (overrides -a)\n\
+-    -m nr        Size of shared memory allocated in Megabytes\n\
+-    -M nr        Size of pkg memory allocated in Megabytes\n\
++    -m nr        Size of shared memory allocated in Megabytes (k/m/g\n\
++                 suffixes; INIT:CAP for an elastic HG_MALLOC arena)\n\
++    -M nr        Size of pkg memory allocated in Megabytes (same form)\n\
+     -w dir       Change the working directory to \"dir\" (default \"/\")\n\
+     -t dir       Chroot to \"dir\"\n\
+     -u uid       Change uid \n\
 diff --git a/main.c b/main.c
 index c0684745f4..78157e3cf1 100644
 --- a/main.c
@@ -1038,27 +1048,29 @@ index c0684745f4..78157e3cf1 100644
  #else
  	LM_NOTICE("using system memory for private process memory\n");
  #endif
-diff --git a/mem/README.hg_malloc_v3.md b/mem/README.hg_malloc_v3.md
+diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..27bb7b004d
+index 0000000000..f4c2a56ddc
 --- /dev/null
-+++ b/mem/README.hg_malloc_v3.md
-@@ -0,0 +1,214 @@
++++ b/mem/README.hg_malloc.md
+@@ -0,0 +1,312 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
 +
 +## 1. Allocation
 +
-+**Size classes.** Requests up to 64 KB are served from 21 fixed size classes, 64 B to 64 KB. Every cell carries a small hidden header with its class, so a free needs no lookup. Larger requests go to a coalescing large tier that packs into whole pages.
++**Size classes.** Requests up to 64 KB (including an 8-byte cell header) are served from 21 fixed size classes, 64 B to 64 KB. Every cell carries a small hidden header with its class, so a free needs no lookup. Larger requests go to a coalescing large tier that packs into whole pages.
 +
 +**The common path takes no lock.** Each process (and each thread of a threaded process) keeps a private free list per class. An allocation pops from it and a free pushes to it - no lock, no shared cache line. When a private list runs dry it refills a batch from a shared per-class pool; when it grows past its threshold it donates a batch back. Only those batch transfers take the arena lock.
 +
-+**Blocks and the buddy allocator.** The arena is a grid of 2 MB pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
++**Blocks and the buddy allocator.** The arena is a grid of huge pages - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
++
++**Small arenas.** An arena whose initial size and cap are both below one huge page runs in small mode: 256 KB pages on plain 4 KB memory, at least 512 KB. With a cap of one huge page or more, the initial size must be at least one huge page.
 +
 +**Idle caches are swept.** Every 30 s each process flushes what its private lists hold back to the shared pool (staggered, a process or two per second), keeping a small residue for the classes it is actively using. Without this, a worker that went idle would keep its cached cells forever.
 +
-+**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `hg_stats` (`corruption`) and logged once; the process keeps running.
++**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `hg_stats` (`corruption`) and logged at CRITICAL on each detection; the process keeps running. Detection happens when the second copy reaches the shared pool: a cell freed twice and taken again by the same process before its next flush is not caught.
 +
 +## 2. Backing memory
 +
@@ -1071,15 +1083,15 @@ index 0000000000..27bb7b004d
 +| 3 | THP: `MADV_COLLAPSE` after fill | pages collapsed into huge pages afterwards |
 +| 4 | plain 4 KB pages | always available |
 +
-+Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and why when it is 4 KB. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
++Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and says why when THP is turned off by a host setting. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
 +
 +**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
 +
-+**Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). If the pool cannot hold the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup.
++**Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). If the pool can hold the initial size but not the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup. If it cannot hold even the initial size, the arena starts on THP with its full cap and stays elastic.
 +
 +## 3. Elastic arenas
 +
-+`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size.
++`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size. With a cap of one huge page or more, INIT must be at least one huge page (2 MB on x86-64).
 +
 +**One mapping, created before fork.** The whole cap is mapped once, shared, before any worker forks. Growth and shrink never create or change mappings - they populate and release ranges of that one shared object, which every process sees immediately. An untouched reserved range costs only page-table entries.
 +
@@ -1091,11 +1103,11 @@ index 0000000000..27bb7b004d
 +
 +- **Exhaustion** - always armed once a cap exists. An allocation that finds no memory grows the arena and retries once.
 +- **Headroom** (`hg_grow_ahead`, default on) - when the free part of the arena drops below twice its reserve floor, one step is grown ahead of demand.
-+- **Profile** - with an `auto_scaling_profile`, live usage above the profile's threshold for the configured number of cycles grows one step before anything fails.
++- **Profile** - with an `auto_scaling_profile`, usage is sampled once per cycle; at the end of each block of W cycles, if it was at or above the up-threshold in at least C of them, one step is grown before anything fails.
 +
-+**A grow is a two-phase commit.** The step is reserved under the arena lock; the expensive part - faulting the pages in, pinning them, verifying their backing - runs with the lock released; the new pages are published under the lock again, in constant time. Other allocations keep running throughout. One grow is in flight at a time: a process that runs out while it is in progress waits for the publish without holding the lock (up to 2 s, then the request fails and `grow_wait_timeouts` counts it).
++**A grow is a three-phase commit.** The step is reserved under the arena lock; the expensive part - faulting the pages in, pinning them, verifying their backing - runs with the lock released; the new pages are published under the lock again, in constant time. Other allocations keep running throughout. One grow is in flight at a time: a process that runs out while it is in progress waits for the publish without holding the lock (up to 2 s, then the request fails and `grow_wait_timeouts` counts it).
 +
-+**The maintenance process.** An elastic shared arena gets a dedicated core process, `HG maintenance`. It serves no requests; every second it applies the headroom rule, every `hg_scaling_cycle` seconds it evaluates the profile and the shrink policy, and it does the populate of any step it grows itself - so no SIP worker waits on a proactive grow.
++**The maintenance process.** Elastic shared arenas (the shm arena and module arenas) get a dedicated core process, `HG maintenance`. It serves no requests; every second it applies the headroom rule, every `hg_scaling_cycle` seconds it evaluates the profile and the shrink policy, and it does the populate of any step it grows itself - so no SIP worker waits on a proactive grow. Private arenas have no maintenance process: each process runs its own arena's policy in its 30 s cache sweep.
 +
 +**Step size.** `shm_grow_granule` / `pkg_grow_granule`, default 16 MB, rounded to the arena page. Smaller steps track demand more closely and make each commit shorter.
 +
@@ -1109,15 +1121,17 @@ index 0000000000..27bb7b004d
 +| backing | the hugetlb pool (tier 1, checked at startup), or `mlock()` | resource refusal |
 +| host memory | `MemAvailable` must stay above `hg_ram_floor_mb` (default max(256 MB, MemTotal/20)) | resource refusal |
 +
-+The host-memory check charges a private-arena step once per worker process, since every worker grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
++The host-memory check charges a private-arena step once per OpenSIPS process, since every process grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
 +
-+Every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too. An elastic arena warns at startup when the limit cannot cover its growth, and a refused grow names the resource that ran out - the limit, or the hugetlb pool.
++Every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too. An elastic arena warns at startup when the limit cannot cover its growth, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4, an arena that could not pin its initial size runs unpinned, and its grows are populated without pinning instead of refused (section 8).
 +
 +### 3.3 GROW-BLOCKED
 +
-+A resource refusal that persists is an incident; a single one is not. A refusal arms the state; it latches when refusals are still accumulating a full sweep interval later (or after a reclaim pass did not help), and clears on the next successful grow. Isolated refusals never latch.
++Only resource refusals count: the memory-lock limit, the hugetlb pool, or the host floor. Reaching the cap or the profile's scale-up target is a limit doing its job: it is logged once as a notice and counted in `grow_refused`, and never latches.
 +
-+When latched: the `hg_shm_grow_blocked` statistic is 1, one warning is logged, and the `E_CORE_SHM_GROW_BLOCKED` event is raised - from the sweep timer, never under the arena lock - with `arena`, `committed_mb`, `cap_mb` and `grow_refused`.
++A resource refusal that persists is an incident; a single one is not. The first refusal arms the state. It latches at the next 30 s sweep tick if refusals continued, or sooner if a reclaim pass did not help. It clears on the next successful grow, or when free space recovers above twice the reserve floor. Isolated refusals never latch.
++
++When latched: the `hg_shm_grow_blocked` statistic is 1, one warning is logged, and the `E_CORE_SHM_GROW_BLOCKED` event is raised at the next sweep tick - from the sweep timer, never under the arena lock - with `arena`, `committed_mb`, `cap_mb` and `grow_refused`. While it lasts the event is raised again periodically.
 +
 +```
 +event_route[E_CORE_SHM_GROW_BLOCKED] {
@@ -1131,23 +1145,23 @@ index 0000000000..27bb7b004d
 +
 +**Only whole free pages are released.** A page is released only when the buddy has merged it back into one free top-level block - which means no cell in it is in use or sitting in any process's private cache. No coordination with other processes is needed: nothing can hold a pointer into it.
 +
-+**The drain.** The shrink decision is made per policy cycle: after the profile's quiet window (live usage at or below its down-threshold for the configured cycles), the arena starts draining, releasing up to `hg_shrink_step` (default 64 MB) per maintenance tick, first from the top of the arena and, with `hg_interior_release = 1`, also from anywhere inside it. The gates are re-checked every tick, and the drain stops at the headroom line, so a release never triggers the grow that would undo it. Any grow ends the drain, and shrink counting resumes only after a cool-off of ten profile cycles.
++**The drain.** The shrink decision is made per policy cycle. With a profile, the arena starts draining after usage has stayed at or below the down-threshold for the profile's C consecutive cycles; a profile without a `scale down` clause never shrinks. Without a profile, an elastic arena drains after 4 quiet sweeps (2 minutes) in which its free space exceeds one grow step plus four times the reserve floor. A shared arena then releases up to `hg_shrink_step` (default 64 MB) per maintenance tick from the top of the arena, and with `hg_interior_release = 1` up to another `hg_shrink_step` from inside it; a private arena releases one step per quiet window. The gates are re-checked every tick, and the drain stops at the headroom line, so a release never triggers the grow that would undo it. Any grow ends the drain, and shrink counting resumes only after a cool-off of 10 x C cycles (C = the profile's scale-down cycle count).
 +
 +**The release.** Pages leave the free list first, under the lock; the release itself (`MADV_REMOVE` on the shared arena, `MADV_DONTNEED` on a private one) runs with the lock dropped; if the kernel refuses, the pages go straight back. On tier 1 released pages return to the hugetlb pool. A kernel that does not support the advice leaves the arena grown and is noted once; no further release is attempted.
 +
 +## 4. Private (pkg) arenas
 +
-+- Each worker creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every worker individually. The pre-fork parent arena stays fixed at the initial size and never uses hugetlb, so no child can fault on the pool through a copy-on-write page.
-+- A worker grows and shrinks only its own arena; its policy runs in its own sweep.
-+- Host cost multiplies with the worker count - and on tier 1, so does the pool reservation, since each worker's arena reserves its own cap.
++- Each process creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every process individually. The pre-fork parent arena never uses hugetlb, so no child can fault on the pool through a copy-on-write page, and never gets the profile; it keeps the `-M` cap and can still grow on exhaustion.
++- A process grows and shrinks only its own arena; its policy runs in its own 30 s sweep, whatever `hg_scaling_cycle` is set to.
++- Host cost multiplies with the process count - and on tier 1, so does the pool reservation, since each process's arena reserves its own cap.
 +
 +## 5. Module arenas
 +
-+A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cache whose size and lifetime have nothing to do with transactions. It gets the same size classes, caches, reclaim, elastic growth and statistics, independent of the core `-a` choice. When HG_MALLOC is not built, the API compiles to stubs and the module falls back to ordinary shm.
++A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cache whose size and lifetime have nothing to do with transactions. It gets the same size classes, caches, reclaim and elastic growth, independent of the core `-a` choice, and appears in `core:hg_stats` (not in the `hgmem:` statistics, which describe the core shm arena). When HG_MALLOC is not built, the API compiles to stubs that return NULL, so the module must fall back to ordinary shm itself.
 +
 +## 6. Monitoring
 +
-+**MI:** `core:hg_stats` returns, per arena (the shared arena and the calling process's private one):
++**MI:** `core:hg_stats` returns, per arena (the shared arena, every module arena, and the calling process's private one):
 +
 +| field | meaning |
 +|---|---|
@@ -1156,24 +1170,24 @@ index 0000000000..27bb7b004d
 +| `grows`, `grows_proactive`, `grows_exhaustion`, `grow_refused`, `grow_blocked` | growth history and the latched gauge |
 +| `shrinks`, `punches`, `draining`, `whole_free_pages` | release history and what could be released now |
 +| `live_committed`, per-class carve and reuse | what is in use and where |
-+| `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats), stalls, the worst hold and its reason, commit and release times |
++| `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats, other), stalls, the worst hold and its reason, commit and release times |
 +| `corruption` | double frees, foreign pointers, bad classes, counted per kind |
 +
-+**Statistics:** `hg_shm_*` counters next to `shmem:` (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
++**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
 +
-+**Events:** `E_CORE_SHM_GROW_BLOCKED` (section 3.3) and `E_CORE_HG_LOCK_STALL`, raised for an arena-lock hold at or above `hg_lock_stall_us` (default 1000 us), with `reason`, `hold_us`, `process` and `stalls`.
++**Events:** `E_CORE_SHM_GROW_BLOCKED` (section 3.3) and `E_CORE_HG_LOCK_STALL`, raised for a shared-arena lock hold at or above `hg_lock_stall_us` (default 1000 us), with `reason`, `hold_us`, `process` and `stalls`.
 +
-+**Note on `shmem:free_size`.** Cells cached in private lists count as used, so free memory reads lower than what is reusable. Alert on `grow_blocked` and on the lock statistics, not on `free_size`.
++**Note on `shmem:free_size`.** It counts only memory not yet carved into size-class blocks. Free cells already carved - in private caches or the shared pool - are reusable for their class but not counted as free, so free memory reads lower than what is reusable. Alert on `grow_blocked` and on the lock statistics, not on `free_size`.
 +
 +## 7. Sizing
 +
 +1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required on every tier for an elastic arena.
-+2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x workers`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late workers to THP.
++2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x processes`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late processes to THP.
 +   **Tiers 2-3 instead of a pool:** THP `enabled` = `madvise` or `always` (private arenas) and `shmem_enabled` = `advise` or `always` (shared arena). With neither a pool nor THP, every arena runs on 4 KB pages.
-+3. **Private caps multiply:** `-M 16:64` on 30 workers is up to 1.9 GB of potential pinned growth.
++3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
 +4. **Tier 1 releases go back to the pool,** not to general memory; shrink `vm.nr_hugepages` to give them to the host.
 +5. **Measuring the pool:** `HugePages_Free` alone also moves with private hugetlb use; the shared arena's pages are `(HugePages_Total - HugePages_Free) - sum of Private_Hugetlb over all processes`.
-+6. **Memory per object:** size-class rounding costs about 30% more shared memory per stored object than F_MALLOC.
++6. **Memory per object:** about the same as F_MALLOC for registrations (+2% live memory, measured on 400k contacts); more for workloads dominated by 1-4 KB objects, from size-class rounding. `used_size` counts each object at its class size, so it reads higher than the bytes requested.
 +
 +## 8. Troubleshooting
 +
@@ -1182,12 +1196,13 @@ index 0000000000..27bb7b004d
 +| startup: `RLIMIT_MEMLOCK is N KB, but growing needs M KB locked` | memory lock limit too low for the arena's growth | `LimitMEMLOCK=infinity` in the unit |
 +| `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
 +| `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
++| startup: `below the 2 MB minimum viable arena` | `-m`/`-M` INIT under one huge page with a cap of one huge page or more | INIT of at least 2 MB, or keep both INIT and cap under 2 MB |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 +| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
 +| grown pages on 4 KB on a THP host | each step negotiates its own backing | expected; see `tier_bytes`, or use tier 1 |
-+| never shrinks | usage above the down-threshold, inside the post-grow cool-off, or the top page in use | check `hg_stats`; enable `hg_interior_release` to release from inside the arena |
-+| `DRY RUN - would grow` and nothing happens | `hg_autoscale_dry_run = 1` | set 0 to act |
++| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `hg_stats`; enable `hg_interior_release` to release from inside the arena |
++| `DRY RUN - would grow` and allocations fail past the initial size | `hg_autoscale_dry_run = 1` blocks all growth | set 0 to act |
 +| testing under `ulimit -l` shows no refusals | running as root: `CAP_IPC_LOCK` lifts the limit | test as an unprivileged user (`setpriv`) |
 +
 +## 9. Testing
@@ -1204,7 +1219,7 @@ index 0000000000..27bb7b004d
 +| `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 +| `-M INIT[:CAP]` | private (per-process) arena, same form |
 +
-+Sizes are MB, or take a `k`/`m`/`g` suffix: `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
++Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 4m:16m`. With a cap of one huge page (2 MB on x86-64) or more, INIT must be at least one huge page; an arena whose INIT and cap are both under one huge page runs in small mode on 4 KB pages, at least 512 KB. Without a cap the arena is fixed. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
 +
 +### Memory autoscaling profiles
 +
@@ -1216,7 +1231,7 @@ index 0000000000..27bb7b004d
 +    scale down to 256 on 30% for 120 cycles
 +
 +auto_scaling_profile = MEM_PKG
-+    scale up to 64 on 80% for 2 cycles within 5
++    scale up to 32 on 80% for 2 cycles within 5
 +    scale down to 8 on 20% for 60 cycles
 +
 +shm_auto_scaling_profile = MEM_SHM
@@ -1225,12 +1240,12 @@ index 0000000000..27bb7b004d
 +
 +| element | meaning for an arena |
 +|---|---|
-+| `up to N` | growth ceiling, within the `-m`/`-M` cap |
-+| `on P% for C cycles within W` | grow when live usage is at or above P% of the committed arena in C of the last W cycles |
-+| `down to M` | shrink floor - may be below the initial size |
-+| `on Q% for C cycles` | release memory after C consecutive cycles at or below Q% |
++| `up to N` | growth ceiling: above the initial size and within the `-m`/`-M` cap |
++| `on P% for C cycles within W` | usage is sampled once per cycle; at the end of each block of W cycles, if it was at or above P% of the committed arena in at least C of them, one step is grown |
++| `down to M` | shrink floor - may be below the initial size, must be below `up to N` |
++| `on Q% for C cycles` | release memory after C consecutive cycles at or below Q%; after any grow, shrink counting waits 10 x C cycles |
 +
-+Usage is live usage - what is handed out - not the carved footprint. A pkg profile governs every worker's private arena separately, so its numbers are per-worker. A profile written with size suffixes, or with a target of 1000 or more, is refused if it is attached to a process group, so a memory profile cannot be mistaken for a worker count.
++Usage is live usage - what is handed out - not the carved footprint. A shared-arena cycle is `hg_scaling_cycle` seconds; a pkg profile runs in each process's 30 s cache sweep and governs every process's private arena separately, so its numbers are per process. A profile without a `scale down` clause never shrinks the arena; an elastic arena with no profile at all still releases memory after 2 quiet minutes. A profile written with size suffixes, or with a target of 1000 or more, is refused if it is attached to a process group, so a memory profile cannot be mistaken for a worker count.
 +
 +Choosing the numbers: `P` is the occupancy you want the arena to run at (70-80% is the usual shape) and `Q` should sit well below it (20-40%), so the band between them absorbs normal swings without growing and shrinking back and forth.
 +
@@ -1241,25 +1256,118 @@ index 0000000000..27bb7b004d
 +| parameter | default | meaning |
 +|---|---|---|
 +| `shm_auto_scaling_profile` | none | profile that drives the shared arena |
-+| `pkg_auto_scaling_profile` | none | profile that drives each worker's private arena |
-+| `shm_grow_granule` | 16m | size of one grow step of the shared arena, rounded to the arena page |
-+| `pkg_grow_granule` | 16m | the same for every worker's private arena |
++| `pkg_auto_scaling_profile` | none | profile that drives each process's private arena |
++| `shm_grow_granule` | 16m (one page on a small arena) | size of one grow step of the shared arena, rounded to the arena page |
++| `pkg_grow_granule` | 16m (one page on a small arena) | the same for every process's private arena |
 +| `hg_ram_floor_mb` | 0 = max(256 MB, MemTotal/20) | host free memory a grow may never take the host below |
-+| `hg_autoscale_dry_run` | 0 | 1 = log what the policy would do, never act |
++| `hg_autoscale_dry_run` | 0 | 1 = advise only: no growth of any kind and no shrink; logs what it would have done once per episode and counts suppressed grows in `hg_shm_grow_refused`. Allocations beyond the initial size fail |
 +| `hg_grow_ahead` | 1 | keep free headroom by growing one step before an allocation has to |
-+| `hg_scaling_cycle` | 30 | seconds per policy cycle (the profile's "cycles") |
-+| `hg_shrink_step` | 64m | most an arena releases per maintenance tick |
++| `hg_scaling_cycle` | 30 | seconds per policy cycle of shared arenas (the profile's "cycles"); private arenas use the fixed 30 s sweep |
++| `hg_shrink_step` | 64m | most a shared arena releases from its top per maintenance tick (plus up to as much again from inside with `hg_interior_release`); a private arena releases one step per quiet window |
 +| `hg_interior_release` | 0 | 1 = give back whole free pages from anywhere in the arena, not only the top |
-+| `hg_lock_stall_us` | 1000 | an arena-lock hold at or above this is a stall: counted, and raises `E_CORE_HG_LOCK_STALL`; 0 disables |
++| `hg_lock_stall_us` | 1000 | an arena-lock hold at or above this is a stall: counted per arena, and raises `E_CORE_HG_LOCK_STALL` for the shared arena; 0 disables |
++
++Example:
++
++```
++shm_auto_scaling_profile = MEM_SHM
++shm_grow_granule = 32m
++hg_ram_floor_mb = 1024
++hg_lock_stall_us = 2000
++```
++
++### Events
++
++Both events describe the shared arena and are raised from the 30 s cache-sweep timer, never while the arena lock is held. Catch them in the script with `event_route` or send them out with any event transport (`event_datagram`, `event_stream`, `event_rabbitmq`, ...).
++
++#### E_CORE_SHM_GROW_BLOCKED
++
++The shared arena needs to grow and a resource refuses: the memory-lock limit, the hugetlb pool, or the host floor (`hg_ram_floor_mb`). Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
++
++| parameter | meaning |
++|---|---|
++| `arena` | `shm` |
++| `committed_mb` | memory the arena holds now |
++| `cap_mb` | the `-m` cap - committed is below it, since a full arena does not raise this event |
++| `grow_refused` | refused grows so far |
++
++What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`hg_stats`, `hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
++
++#### E_CORE_HG_LOCK_STALL
++
++A process held the shared arena's lock for `hg_lock_stall_us` (default 1000 us) or longer. Raised at most once per 30 s, carrying the most recent stall; `hg_lock_stall_us = 0` turns it off.
++
++| parameter | meaning |
++|---|---|
++| `arena` | `shm` |
++| `reason` | what the lock was held for: `refill` (taking cells or a new block), `return` (giving cells or a block back), `flush` (a process emptying its private cache), `large` (an allocation too big for the 64 KB class), `policy` (a grow or shrink decision), `stats` (a statistics walk), `other` |
++| `hold_us` | how long it was held |
++| `process` | OpenSIPS process number that held it, as listed by `opensips-cli -x mi ps` |
++| `stalls` | stalls since startup |
++
++What to do: an occasional stall during a growth spurt is normal. A steady stream, or one `reason` dominating, is worth a look at the per-reason hold histogram in `hg_stats`.
++
++#### Examples
++
++In the script:
++
++```
++loadmodule "event_route.so"
++
++event_route[E_CORE_SHM_GROW_BLOCKED] {
++    xlog("L_CRIT", "HG: shm arena cannot grow - $param(committed_mb) of $param(cap_mb) MB committed, $param(grow_refused) refusals\n");
++}
++
++event_route[E_CORE_HG_LOCK_STALL] {
++    xlog("L_WARN", "HG: shm lock held $param(hold_us) us by process $param(process) for $param(reason), $param(stalls) stalls so far\n");
++}
++```
++
++which logs, for example:
++
++```
++CRITICAL:HG: shm arena cannot grow - 896 of 1024 MB committed, 37 refusals
++WARNING:HG: shm lock held 1262 us by process 9 for return, 2 stalls so far
++```
++
++To another system, with `event_datagram` loaded:
++
++```bash
++opensips-cli -x mi event_subscribe E_CORE_SHM_GROW_BLOCKED udp:10.0.0.10:9999
++```
++
++### Monitoring
++
++```bash
++opensips-cli -x mi core:hg_stats      # per arena: tier, committed and cap, grows and shrinks, lock holds per reason, corruption counters
++opensips-cli -x mi core:hg_advise     # what -m and -M should be, from the peak each arena actually reached
++opensips-cli -x mi statistics:get hgmem:
++```
++
++`hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `hg_advise` covers the worst process.
++
++The `hgmem:` statistics group holds the shared arena's figures. The ones worth alerting on:
++
++| statistic | alert when |
++|---|---|
++| `hg_shm_grow_blocked` | 1 - growth refused for a sustained period |
++| `hg_shm_corruption` | above 0 - memory was corrupted and the allocator caught it |
++| `hg_shm_repin_failed` | above 0 - memory taken back from the host could not be pinned again |
++| `hg_shm_lock_stalls` | rising steadily |
++| `hg_shm_committed` against `hg_shm_cap` | committed close to the cap |
++
++Others for graphs: `hg_shm_grows`, `hg_shm_grows_proactive`, `hg_shm_grows_exhaustion`, `hg_shm_grow_refused`, `hg_shm_shrinks`, `hg_shm_shrink_bytes`, `hg_shm_live`, `hg_shm_live_peak`, `hg_shm_carved`, `hg_shm_free_to_carve`, `hg_shm_lock_hold_max_us`, `hg_shm_tier`.
++
++Note that `shmem:free_size` counts only memory not yet carved into size-class blocks; free cells already carved are reusable for their class but not counted, so it reads lower than what is reusable. Alert on the figures above, not on `free_size`.
 +
 +### Host requirements
 +
-+- `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`: the committed arena is pinned and every grow is an `mlock()`, which checks the limit on hugetlb mappings too. HG warns at startup when the limit cannot cover growth, and a refused grow names the limit or the hugetlb pool, whichever ran out.
++- `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`: the committed arena is pinned and every grow is an `mlock()`, which checks the limit on hugetlb mappings too. HG warns at startup when the limit cannot cover growth, and a refused grow names the limit or the hugetlb pool, whichever ran out. On tiers 2-4, an arena that could not pin its initial size runs unpinned and grows without pinning instead of refusing.
 +- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
-+  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in 2 MB pages. On this tier the whole cap is reserved from the pool when the arena is created; a pool too small for the cap gives a fixed arena on huge pages instead of an elastic one, and says so.
++  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
 +  - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
 diff --git a/mem/common.c b/mem/common.c
-index 598b351600..62e76f37c8 100644
+index 598b351600..a953b2bf7a 100644
 --- a/mem/common.c
 +++ b/mem/common.c
 @@ -25,7 +25,11 @@
@@ -1274,19 +1382,11 @@ index 598b351600..62e76f37c8 100644
  
  /* returns -1 if @mm_name is unrecognized */
  int set_global_mm(const char *mm_name)
-@@ -65,6 +69,19 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
+@@ -65,6 +69,11 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
  		return 0;
  	}
  
-+	/* Both spellings select the same allocator.  The binary names ITSELF
-+	 * with the generation suffix (mm_str(), opensips -V), so a log or a -V
-+	 * paste says which arena is running; but the plain name has to keep
-+	 * selecting it, because existing /etc/default/opensips files pass
-+	 * "-a HG_MALLOC" and swapping a binary must not require editing the
-+	 * sizing file in lockstep - nor break the rollback in the other
-+	 * direction.  See mem/hg_version.h. */
-+	if (!strcasecmp(mm_name, "HG_MALLOC") ||
-+	    !strcasecmp(mm_name, HG_MALLOC_NAME)) {
++	if (!strcasecmp(mm_name, HG_MALLOC_NAME)) {
 +		*mm = MM_HG_MALLOC;
 +		return 0;
 +	}
@@ -1294,13 +1394,12 @@ index 598b351600..62e76f37c8 100644
  #ifdef DBG_MALLOC
  	if (!strcasecmp(mm_name, "F_MALLOC_DBG")) {
  		*mm = MM_F_MALLOC_DBG;
-@@ -85,6 +102,12 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
+@@ -85,6 +94,11 @@ int parse_mm(const char *mm_name, enum osips_mm *mm)
  		*mm = MM_F_PARALLEL_MALLOC_DBG;
  		return 0;
  	}
 +
-+	if (!strcasecmp(mm_name, "HG_MALLOC_DBG") ||
-+	    !strcasecmp(mm_name, HG_MALLOC_NAME "_DBG")) {
++	if (!strcasecmp(mm_name, HG_MALLOC_NAME "_DBG")) {
 +		*mm = MM_HG_MALLOC_DBG;
 +		return 0;
 +	}
@@ -1378,10 +1477,10 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..7d59f491f3
+index 0000000000..953ab96708
 --- /dev/null
 +++ b/mem/hg_arena.c
-@@ -0,0 +1,2348 @@
+@@ -0,0 +1,2346 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -3088,11 +3187,9 @@ index 0000000000..7d59f491f3
 +
 +	if (c >= HG_NCLASSES) {
 +		/* the class byte was clobbered - freeing through it would
-+		 * corrupt the pools; leak the cell and shout instead. This is
-+		 * the only corruption check Phase 1 has - true double-free
-+		 * detection (has THIS pointer already been freed) needs a
-+		 * per-cell allocated/free bit that isn't implemented yet, see
-+		 * the file header note on Phase 1 scope. */
++		 * corrupt the pools; leak the cell and shout instead. (Double
++		 * frees are caught later, at the shared pool, by the per-block
++		 * free map.) */
 +		hg_corrupt(hb, HG_C_BAD_CLASS);
 +		LM_CRIT("%s: cell %p carries invalid class %u - leaking it\n",
 +			hb->name, p, c);
@@ -3732,10 +3829,10 @@ index 0000000000..7d59f491f3
 +         * meaningful without the allocator. */
 diff --git a/mem/hg_arena.h b/mem/hg_arena.h
 new file mode 100644
-index 0000000000..6ceb2afcbf
+index 0000000000..f67128179d
 --- /dev/null
 +++ b/mem/hg_arena.h
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,136 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -3760,12 +3857,10 @@ index 0000000000..6ceb2afcbf
 +
 +/*
 + * Slab arena, adapted from the private slab arena of an earlier caching
-+ * module: cells live in fixed-size chunks bump-carved from a huge-page
-+ * reservation and NEVER returned while the server runs - that is what keeps
-+ * the fast path lock-free. A chunk is permanently bound to one size class;
-+ * cells never straddle or move (Phase 1 has no defrag/GC - see the estimate
-+ * discussion; the only mitigation is idle-chunk return, added in a later
-+ * pass, not this one).
++ * module: cells live in fixed-size blocks carved from the buddy allocator.
++ * A block is bound to one size class while any of its cells is in use;
++ * cells never straddle or move. When every cell of a block is free again
++ * the block goes back to the buddy and can be re-carved for another class.
 + *
 + * Two structural differences from that arena, both required because
 + * HG_MALLOC is a general-purpose shm/pkg allocator, not a single cache
@@ -3845,14 +3940,9 @@ index 0000000000..6ceb2afcbf
 +void hg_cell_free(struct hg_block *hb, void *p);
 +#endif
 +
-+/* a raw, 64-byte-aligned, never-freed region - same backing seam and
-+ * never-returned guarantee as chunks, but NOT carved into cells and NOT
-+ * zeroed. Not on the hg_malloc()/hg_free() hot path in Phase 1; kept for
-+ * future index-structure consumers. */
-+
-+/* cross-process free (not used in Phase 1 - no expiry/maintenance worker at
-+ * the allocator level - kept for API symmetry with the arena this was
-+ * ported from, and for the shared-pool donate/refill path itself) */
++/* free straight to the shared pool, bypassing the private cache: used for
++ * a cell freed into an arena the caller has no cache for (a foreign arena,
++ * or a process with no private slot) */
 +void hg_cell_free_global(struct hg_block *hb, void *cell);
 +
 +/* re-sync after fork(): see hg_malloc_child_init() in hg_malloc.c */
@@ -6595,10 +6685,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..6fb2167832
+index 0000000000..49a778484a
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,1828 @@
+@@ -0,0 +1,1830 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7596,7 +7686,7 @@ index 0000000000..6fb2167832
 +	/* profile numbers are MB, or KB when the config used a size suffix
 +	 * (p->mem_kb_units, set by the parser); rounding and the viability
 +	 * floor follow the page unit THIS arena runs on, so a small-mode
-+	 * arena is judged in its own 64 KB currency, not huge pages */
++	 * arena is judged in its own 256 KB currency, not huge pages */
 +	int ush = p->mem_kb_units ? 10 : 20;
 +	unsigned long apage = hb ? hb->hps :
 +		hg_arena_page(init_bytes, cap_bytes);
@@ -7960,7 +8050,7 @@ index 0000000000..6fb2167832
 +	if (hb->shrink_step < apage)
 +		hb->shrink_step = apage;
 +	/* the page unit this arena's whole grid runs on: the probed huge page
-+	 * size, or the small-mode 64 KB page - hg_arena_init() lays out the
++	 * size, or the small-mode 256 KB page - hg_arena_init() lays out the
 +	 * page grid from this, never re-probing */
 +	hb->hps = apage;
 +	hb->tier = tier;
@@ -8064,13 +8154,15 @@ index 0000000000..6fb2167832
 +
 +		if (lim && lim < need)
 +			LM_WARN("%s arena: RLIMIT_MEMLOCK is %lu KB, but growing "
-+				"needs %lu KB locked (%s) - every grow will be "
-+				"refused. Set LimitMEMLOCK=infinity in the service "
-+				"unit (or ulimit -l unlimited) before relying on the "
-+				"%lu %s cap.\n", name, lim >> 10, need >> 10,
++				"needs %lu KB locked (%s) - %s. Set "
++				"LimitMEMLOCK=infinity in the service unit (or ulimit "
++				"-l unlimited) before relying on the %lu %s cap.\n",
++				name, lim >> 10, need >> 10,
 +				tier == HG_MEM_HUGETLB ? "one grow granule" :
-+				"the whole cap", HG_SZ_VAL(hb->hcap),
-+				HG_SZ_UNIT(hb->hcap));
++				"the whole cap",
++				hb->unpinned ? "the arena runs unpinned and grows "
++				"without pinning" : "grows past the limit will be "
++				"refused", HG_SZ_VAL(hb->hcap), HG_SZ_UNIT(hb->hcap));
 +	}
 +
 +	return hb;
@@ -8429,7 +8521,7 @@ index 0000000000..6fb2167832
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..7996730d2d
+index 0000000000..df4846f22a
 --- /dev/null
 +++ b/mem/hg_malloc.h
 @@ -0,0 +1,1516 @@
@@ -8479,7 +8571,7 @@ index 0000000000..7996730d2d
 +#endif
 +
 +#define HG_NCLASSES  21
-+#define HG_CELL_MAX  65536  /* largest cell; bigger allocs fail (Phase 1) */
++#define HG_CELL_MAX  65536  /* largest cell; bigger requests use the large tier */
 +
 +/* the four-tier huge-page ladder, best first */
 +enum hg_mem_tier {
@@ -9157,7 +9249,7 @@ index 0000000000..7996730d2d
 +	                                       * punch, lock released */
 +	struct hg_lkstat      lk_gc;          /* gc_class() block returns */
 +	struct hg_lkstat      lk_cphase[HG_CP_PHASES]; /* commit, by phase */
-+	/* two-phase commit: a grow RESERVES [span_end, span_pending) under
++	/* three-phase commit: a grow RESERVES [span_end, span_pending) under
 +	 * the lock, populates it with the lock released, then publishes it
 +	 * under the lock. One grow in flight at a time; a worker that exhausts
 +	 * meanwhile waits for the publish without the lock (lk_grow_wait). */
@@ -9434,10 +9526,10 @@ index 0000000000..7996730d2d
 + * delta (>= 1) or -1 with everything rolled back - a refusal, not a
 + * degradation, so a worker never SIGBUSes on memory the allocator
 + * half-committed. Defined in hg_malloc.c because the tier ladder and its
-+ * verification probes live there; called by hg_buddy_grow() under
-+ * hb->lock.
-+ */
-+/* Commit [off, off+delta) of the reservation: populate, pin, verify the
++ * verification probes live there; called by hg_buddy_grow() with
++ * hb->lock released.
++ *
++ * Commit [off, off+delta) of the reservation: populate, pin, verify the
 + * backing (and retrofit huge pages where the host needs it). Called WITHOUT
 + * hb->lock held: it touches no allocator state except the locked_mb
 + * total (atomically) and the once-per-episode refusal flag; the phase
@@ -9492,8 +9584,8 @@ index 0000000000..7996730d2d
 + * the config is parsed (called from init_shm_post_yyparse()). Attaches the
 + * policy to the LIVE shm arena and stashes the pkg policy for the arenas
 + * pt.c creates per child after fork - the pre-fork parent pkg arena
-+ * predates the config and stays fixed, which costs nothing (the attendant
-+ * barely allocates). Fails LOUDLY on a profile that names nothing, exceeds
++ * predates the config and gets no profile (it keeps its -M cap and grows
++ * on exhaustion), which costs nothing (the attendant barely allocates). Fails LOUDLY on a profile that names nothing, exceeds
 + * the -m/-M reservation, or is attached to an arena with no growth room:
 + * a policy that cannot act is a misconfiguration, not a default.
 + */
@@ -10160,10 +10252,10 @@ index 0000000000..b9420b09df
 +#define HG_MALLOC_DYN
 diff --git a/mem/hg_version.h b/mem/hg_version.h
 new file mode 100644
-index 0000000000..ecf70e4f98
+index 0000000000..337edd67db
 --- /dev/null
 +++ b/mem/hg_version.h
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,33 @@
 +/*
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -10185,22 +10277,16 @@ index 0000000000..ecf70e4f98
 + */
 +
 +/*
-+ * The hugepage allocator's name, as one string, used everywhere the
-+ * allocator names itself: the compile-flag list in "opensips -V", the
++ * The allocator's name, as one string, used everywhere it names itself:
++ * the -a/-s/-k selector, the compile-flag list in "opensips -V", the
 + * "allocator: ..." line each arena logs at startup, and mm_str().  One
-+ * definition keeps the three in agreement, so a log line or a -V paste
-+ * identifies exactly which allocator a binary was built with.
-+ *
-+ * Deliberately NOT the accepted spelling on the command line: -a HG_MALLOC
-+ * keeps working (see parse_mm), because existing /etc/default/opensips files
-+ * pass that name and a build should never require the sizing file to
-+ * be edited in lockstep.  This is an identity, not a selector.
++ * definition keeps them in agreement.
 + */
 +
 +#ifndef HG_VERSION_H
 +#define HG_VERSION_H
 +
-+#define HG_MALLOC_NAME  "HG_MALLOC_V3"
++#define HG_MALLOC_NAME  "HG_MALLOC"
 +
 +#endif /* HG_VERSION_H */
 diff --git a/mem/mem.c b/mem/mem.c

@@ -27,13 +27,13 @@ All four arms measured in one session, `-m 2048 -M 32`; HG_MALLOC elastic `-m 12
 |---|---|---|---|---|---|
 | 20,000 | CPU, cores | 2.20 | 2.07 | 2.09 | **1.87** |
 | | UDP drops | 0 | 0 | 0 | **0** |
-| | INVITE p99 | 0.85 ms | 0.89 ms | 0.79 ms | **0.75 ms** |
+| | INVITE p99 (probe) | 0.85 ms | 0.89 ms | 0.79 ms | **0.75 ms** |
 | 45,000 | CPU, cores | 4.15 | 3.92 | 3.91 | **3.32** |
 | | UDP drops | 16,578 | 0 | 5,090 | **0** |
-| | INVITE p99 | 6.8 ms | 4.1 ms | 5.7 ms | **2.4 ms** |
+| | INVITE p99 (probe) | 6.8 ms | 4.1 ms | 5.7 ms | **2.4 ms** |
 | 60,000 | CPU, cores | 5.06 | 5.13 | 5.69 | **3.99** |
 | | UDP drops | 250,185 | 178,585 | 160,448 | **0** |
-| | INVITE p99 | 10.3 ms | 10.6 ms | 12.1 ms | **5.7 ms** |
+| | INVITE p99 (probe) | 10.3 ms | 10.6 ms | 12.1 ms | **5.7 ms** |
 
 Every call completed in every arm; at 60,000 the probe saw INVITE timeouts with F_PARALLEL_MALLOC (4) and HP_MALLOC (4), none with HG_MALLOC. The elastic arena grew from 128 MB to 528 MB, 1,136 MB and 1,504 MB at the three rates. The longest arena-lock hold was 319 us, 497 us and 1,262 us; the 60,000 run recorded 2 holds over the 1 ms stall threshold.
 
@@ -76,3 +76,4 @@ In every HG run the arena grew from 128 MB to 1,584 MB in 91 steps with no lock 
 | arm32, arm64 (cross) | compile and link |
 | i386 (container) | clean; hgstress soak passes |
 | Alpine / musl (container) | clean; hgstress soak passes |
+| OpenSIPS CI on the PR (all compilers, architectures, unit tests, fuzzing) | passes |
