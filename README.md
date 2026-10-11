@@ -6,6 +6,7 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 
 - **Less CPU per call:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second, and about half on a registrar taking 60k registrations per second.
 - **No drops under load:** 0 UDP drops and 0 failed calls at 60k cps, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; the workers keep the socket drained.
+- **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k cps HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
 - **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
 - **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
@@ -92,7 +93,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Costs
 
-- Memory: about the same as F_MALLOC for registrations (+2% live memory, measured on 400k contacts); more for workloads dominated by 1-4 KB objects, from size-class rounding.
+- Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations, 5-13% on tm's 1-4 KB objects at rates with no drops. Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers are Linux-only; elsewhere the arena is plain pinned memory.
 

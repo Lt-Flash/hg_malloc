@@ -36,7 +36,7 @@ All four arms measured in one session, `-m 2048 -M 32`; HG_MALLOC elastic `-m 12
 | | INVITE p99 (probe) | 36 ms | 38 ms | 8.4 ms | **3.3 ms** |
 | | failed calls | 508,165 | 122,206 | 0 | **0** |
 
-Up to 45,000 every call completed in every arm. At 60,000 F_MALLOC ran out of the 2 GB shared memory 16 s into the run (2,121 MB used), and F_PARALLEL_MALLOC ran out in one of its pools after 11 s (1,747 MB used in total); tm could no longer clone requests, calls failed, sipp retransmitted, and all 8 workers saturated. Both also lost 17 probe INVITEs. HP_MALLOC and HG_MALLOC completed every call.
+Up to 45,000 every call completed in every arm. At 60,000 F_MALLOC ran out of the 2 GB shared memory 16 s into the run (2,023 of 2,048 MB used), and F_PARALLEL_MALLOC ran out in one of its pools after 11 s (1,747 MB used in total); tm could no longer clone requests, calls failed, sipp retransmitted, and all 8 workers saturated. Both also lost 17 probe INVITEs. HP_MALLOC and HG_MALLOC completed every call.
 
 The elastic arena grew from 128 MB to 528 MB, 1,136 MB and 1,536 MB at the three rates. The longest arena-lock hold was 550 us, 1,363 us and 1,143 us; 1 hold at 45,000 and 4 at 60,000 went over the 1 ms stall threshold.
 
@@ -50,6 +50,23 @@ The 60,000 point again with `-m 4096 -M 32` (HG_MALLOC `-m 128:4096 -M 16:32`), 
 | | failed calls | 4,412 | 0 | 0 | **0** |
 
 No arm logged a memory error. F_MALLOC peaked at 2,467 MB, more than the 2 GB of the first run, and still failed 4,412 calls whose retransmissions were all dropped; HP_MALLOC's slowest probe INVITE took 1.3 s. HG_MALLOC grew to the same 1,536 MB as with the 2 GB cap, with no lock stall (longest hold 873 us); one client host retransmitted 8,485 times, and six probe INVITEs got their answer only from tm's reply retransmission 500 ms later, with no drop and no send error on the server.
+
+## Memory under load
+
+Peak shared memory in the INVITE runs above, with the UDP drops of the same run:
+
+| calls/s | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+|---|---|---|---|---|
+| 20,000 | 445 MB (0 drops) | 479 MB (0) | 449 MB (0) | **502 MB (0)** |
+| 45,000 | 1,051 MB (31,030) | 1,038 MB (167) | 1,009 MB (19,342) | **1,118 MB (0)** |
+| 60,000, `-m 2048` | ran out at 2,023 MB (7.7 M) | ran out in one pool, 1,747 MB in total (3.6 M) | 1,499 MB (247,051) | **1,489 MB (0)** |
+| 60,000, `-m 4096` | 2,467 MB (1.1 M) | 1,374 MB (4,554) | 1,978 MB (363,419) | **1,486 MB (0)** |
+
+Each INVITE is a tm transaction that stays in shared memory until its ACK arrives and the wait timer (2 s here) runs out. A server that drops packets loses replies and ACKs: tm keeps those transactions while the reply is retransmitted, and the retransmissions cause more drops. So at high rates the peak follows the drops more than the allocator's per-object cost. F_MALLOC and F_PARALLEL_MALLOC are the same allocator family with the same per-object overhead, yet at 60,000 with 4 GB F_MALLOC (1.1 M drops) needed 80% more memory than F_PARALLEL_MALLOC (4,554 drops).
+
+Per object, HG_MALLOC uses a little more: 5-13% at 20,000 and 45,000, where there are few or no drops, from size-class rounding of tm's 1-4 KB request and reply copies. Under overload it needs less: at 60,000 its workers keep up, nothing waits in memory for a retransmission, and it peaked at 1.5 GB against 2.0 GB for HP_MALLOC and 2.5 GB for F_MALLOC. With a 2 GB cap it peaked at 73% of it, where F_MALLOC and F_PARALLEL_MALLOC ran out. Against F_PARALLEL_MALLOC with a 4 GB cap, which had almost no drops, HG_MALLOC needed 8% more.
+
+HG_MALLOC's figure is its peak carved memory (`carved_peak` in `core:hg_stats`), which also counts idle cells in partly used blocks, so it slightly overstates what was in use; the others are `shmem:max_used_size`.
 
 ## Registrar under a cold start: 1.2 million REGISTERs at 60,000 per second
 

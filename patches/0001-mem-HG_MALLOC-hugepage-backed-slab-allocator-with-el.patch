@@ -1,4 +1,4 @@
-From efbc24e243d38b5d70bed685d9ec82d2b32c96f6 Mon Sep 17 00:00:00 2001
+From 1d8a173bffb52f02e82e501c8843e5ede3eca043 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -63,7 +63,7 @@ procedures: mem/README.hg_malloc.md.
  Makefile.defs               |    3 +
  cfg.lex                     |   33 +
  cfg.y                       |  161 ++-
- core_stats.c                |  306 +++++
+ core_stats.c                |  308 +++++
  core_stats.h                |   21 +
  evi/evi_core.c              |    7 +
  evi/evi_core.h              |    8 +
@@ -74,7 +74,7 @@ procedures: mem/README.hg_malloc.md.
  mem/README.hg_malloc.md     |  344 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
- mem/hg_arena.c              | 2406 +++++++++++++++++++++++++++++++++++
+ mem/hg_arena.c              | 2411 +++++++++++++++++++++++++++++++++++
  mem/hg_arena.h              |  136 ++
  mem/hg_buddy.c              | 1651 ++++++++++++++++++++++++
  mem/hg_buddy.h              |  249 ++++
@@ -82,8 +82,8 @@ procedures: mem/README.hg_malloc.md.
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 2161 +++++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1581 +++++++++++++++++++++++
+ mem/hg_malloc.c             | 2183 +++++++++++++++++++++++++++++++
+ mem/hg_malloc.h             | 1584 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -101,7 +101,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 42 files changed, 12198 insertions(+), 39 deletions(-)
+ 42 files changed, 12230 insertions(+), 39 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -434,10 +434,10 @@ index 5647ac79ea..172955ee9e 100644
  				auto_scaling_cycle=$3; }
  		| AUTO_SCALING_CYCLE EQUAL error {
 diff --git a/core_stats.c b/core_stats.c
-index 739a520700..74ac2c7cf9 100644
+index 739a520700..a4d0637a33 100644
 --- a/core_stats.c
 +++ b/core_stats.c
-@@ -186,6 +186,307 @@ static unsigned long get_pkg_fragments( void*proc_id)
+@@ -186,6 +186,309 @@ static unsigned long get_pkg_fragments( void*proc_id)
  	return pkg_status[(unsigned long)proc_id][PKG_FRAGMENTS_SIZE_IDX];
  }
  
@@ -681,6 +681,8 @@ index 739a520700..74ac2c7cf9 100644
 +	unsigned int slot = ticks % HG_SWEEP_INTERVAL;
 +	int i, n = counted_max_processes;
 +
++	hg_sample_live_peaks();
++
 +	if (slot == 0) {
 +		hg_grow_blocked_event(ticks);
 +		hg_oom_report_shared();
@@ -745,7 +747,7 @@ index 739a520700..74ac2c7cf9 100644
  
  int init_pkg_stats(int procs_no)
  {
-@@ -328,3 +629,8 @@ int init_pkg_stats(int procs_no)
+@@ -328,3 +631,8 @@ int init_pkg_stats(int procs_no)
  #endif /* PKG */
  
  #endif /* STATISTICS */
@@ -1059,7 +1061,7 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..71d91f2d79
+index 0000000000..51ec0e2495
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
 @@ -0,0 +1,344 @@
@@ -1198,7 +1200,7 @@ index 0000000000..71d91f2d79
 +3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
 +4. **Tier 1 releases go back to the pool,** not to general memory; shrink `vm.nr_hugepages` to give them to the host.
 +5. **Measuring the pool:** `HugePages_Free` alone also moves with private hugetlb use; the shared arena's pages are `(HugePages_Total - HugePages_Free) - sum of Private_Hugetlb over all processes`.
-+6. **Memory per object:** about the same as F_MALLOC for registrations (+2% live memory, measured on 400k contacts); more for workloads dominated by 1-4 KB objects, from size-class rounding. `used_size` counts each object at its class size, so it reads higher than the bytes requested.
++6. **Memory per object:** a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations, 5-13% on tm's 1-4 KB objects at rates with no drops. Under overload the total is lower, because nothing waits in memory for retransmissions: see [memory under load](https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md#memory-under-load). `used_size` counts each object at its class size, so it reads higher than the bytes requested.
 +
 +## 8. Troubleshooting
 +
@@ -1518,10 +1520,10 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..c53d33316b
+index 0000000000..978a477d9e
 --- /dev/null
 +++ b/mem/hg_arena.c
-@@ -0,0 +1,2406 @@
+@@ -0,0 +1,2411 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -2547,6 +2549,11 @@ index 0000000000..c53d33316b
 +			hg_grow_blocked_tick(hb);
 +			hg_grow_tick(hb);
 +			hg_shrink_tick(hb);
++#ifdef STATISTICS
++			/* the live peak, sampled once per sweep - see
++			 * hg_sample_live_peaks() for the shared arenas */
++			(void)hg_get_real_used(hb);
++#endif
 +			if (!strcmp(hb->name, "pkg"))
 +				hg_pkg_publish(hb);
 +		}
@@ -6792,10 +6799,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..36042bda7e
+index 0000000000..5856bdc6ad
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,2161 @@
+@@ -0,0 +1,2183 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7513,6 +7520,28 @@ index 0000000000..36042bda7e
 +		if (n)
 +			hg_oom_report(hb, n, max_req);
 +	}
++}
++
++/*
++ * The live peak (live_peak, shmem:max_used_size) is a high-water mark taken
++ * when the figure is computed. Refreshed only by statistics reads, it missed
++ * any load that nobody was reading during: measured 4 MB reported after a
++ * 60 s run that carved 1.5 GB. The sweep timer calls this every second for
++ * the shared arenas - O(1) and lock-free, the same computation a statistics
++ * read does - so a peak lasting a second or more is kept.
++ */
++void hg_sample_live_peaks(void)
++{
++#ifdef STATISTICS
++	struct hg_block *hb;
++	int i;
++
++	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
++		hb = hg_arena_reg[i].hb;
++		if (hb && hb->shared)
++			(void)hg_get_real_used(hb);
++	}
++#endif
 +}
 +
 +/*
@@ -8959,10 +8988,10 @@ index 0000000000..36042bda7e
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..f343963dda
+index 0000000000..2512c09a47
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1581 @@
+@@ -0,0 +1,1584 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -9538,9 +9567,11 @@ index 0000000000..f343963dda
 +	 * un-carved), so reporting it as max_used made max_used drift away from
 +	 * real_used forever instead of meaning "the peak real_used reached" -
 +	 * unlike every other allocator. Sampled, not exact: refreshed whenever
-+	 * the stats are read, so a spike between two reads can be missed. The
-+	 * unsynchronized max update is a benign race - a lost update can only
-+	 * under-report, never over-report. */
++	 * the stats are read, every second by the sweep timer for a shared arena
++	 * (hg_sample_live_peaks) and at every sweep flush for a private one, so
++	 * only a spike shorter than that can be missed. The unsynchronized max
++	 * update is a benign race - a lost update can only under-report, never
++	 * over-report. */
 +	unsigned long max_live_used;
 +
 +	/* the fast-path counters - see struct hg_pstat above. Summed by
@@ -10048,6 +10079,7 @@ index 0000000000..f343963dda
 +
 +void hg_oom_report(struct hg_block *hb, unsigned long n, unsigned long max_req);
 +void hg_oom_report_shared(void);
++void hg_sample_live_peaks(void);
 +
 +int hg_pkg_pub_init(unsigned int nproc);
 +void hg_pkg_publish(struct hg_block *hb);
