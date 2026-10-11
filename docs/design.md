@@ -113,7 +113,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats), stalls, the worst hold and its reason, commit and release times |
 | `corruption` | double frees, foreign pointers, bad classes, counted per kind |
 
-**Statistics:** `hg_shm_*` counters next to `shmem:` (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
+**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
 
 **Events:** `E_CORE_SHM_GROW_BLOCKED` (section 3.3) and `E_CORE_HG_LOCK_STALL`, raised for an arena-lock hold at or above `hg_lock_stall_us` (default 1000 us), with `reason`, `hold_us`, `process` and `stalls`.
 

@@ -85,10 +85,11 @@ shm_auto_scaling_profile = MEM_SHM
 
 ```bash
 opensips-cli -x mi core:hg_stats         # per arena: tier, committed/reserved, grows, lock holds, corruption
-opensips-cli -x mi statistics:get shmem:
+opensips-cli -x mi core:hg_advise        # what -m and -M should be, from the peaks actually reached
+opensips-cli -x mi statistics:get hgmem:
 ```
 
-Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CORE_HG_LOCK_STALL` (an arena-lock hold above `hg_lock_stall_us`).
+Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CORE_HG_LOCK_STALL` (an arena-lock hold above `hg_lock_stall_us`). Parameters, examples and what to alert on: [configuration](docs/configuration.md#events).
 
 ## Costs
 
