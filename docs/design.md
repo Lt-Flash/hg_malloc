@@ -10,7 +10,7 @@ How HG_MALLOC works, what it guarantees, and how to run and monitor it. For the 
 
 **Blocks and the buddy allocator.** The arena is a grid of huge pages - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
 
-**Small arenas.** An arena whose initial size and cap are both below one huge page runs in small mode: 256 KB pages on plain 4 KB memory, at least 512 KB. With a cap of one huge page or more, the initial size must be at least one huge page.
+**Small arenas.** An arena with an INIT under one huge page settles its page size by the backing it gets. On plain 4 KB memory it runs in small mode, on 256 KB pages: at least 256 KB with a cap, 512 KB without. On huge pages its INIT is raised to one huge page, and an arena whose cap leaves no room above that page is refused at startup.
 
 **Idle caches are swept.** Every 30 s each process flushes what its private lists hold back to the shared pool (staggered, a process or two per second), keeping a small residue for the classes it is actively using. Without this, a worker that went idle would keep its cached cells forever.
 
@@ -35,7 +35,7 @@ Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier
 
 ## 3. Elastic arenas
 
-`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size. With a cap of one huge page or more, INIT must be at least one huge page (2 MB on x86-64).
+`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size. For the smallest INIT see Small arenas (section 1).
 
 **One mapping, created before fork.** The whole cap is mapped once, shared, before any worker forks. Growth and shrink never create or change mappings - they populate and release ranges of that one shared object, which every process sees immediately. An untouched reserved range costs only page-table entries.
 
@@ -140,7 +140,9 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | startup: `RLIMIT_MEMLOCK is N KB, but growing needs M KB locked` | memory lock limit too low for the arena's growth | `LimitMEMLOCK=infinity` in the unit |
 | `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
 | `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
-| startup: `below the 2 MB minimum viable arena` | `-m`/`-M` INIT under one huge page with a cap of one huge page or more | INIT of at least 2 MB, or keep both INIT and cap under 2 MB |
+| startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
+| startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
+| notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
 | `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 | `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 | arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |

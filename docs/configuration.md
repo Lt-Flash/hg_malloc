@@ -8,7 +8,14 @@
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
 
-Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 4m:16m`. With a cap of one huge page (2 MB on x86-64) or more, INIT must be at least one huge page; an arena whose INIT and cap are both under one huge page runs in small mode on 4 KB pages, at least 512 KB. Without a cap the arena is fixed. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
+Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
+
+The smallest INIT depends on the backing the arena gets:
+
+- **Huge pages:** an arena holds at least one whole huge page (2 MB on x86-64). A smaller INIT is raised to it, with a notice. If the cap leaves no room above that page (`-M 1m:2m`), OpenSIPS refuses to start.
+- **Plain 4 KB pages:** the arena runs on 256 KB pages. INIT can be 256 KB when a cap gives it room to grow (`-M 256k:2m`), 512 KB without one.
+
+These are the allocator's limits, not OpenSIPS's needs: the shared arena must also fit core startup, which makes one allocation of about 540 KB, so give `-m` a cap of 2 MB or more. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
 
 ## Memory autoscaling profiles
 

@@ -1,4 +1,4 @@
-From 77cf79d53ecbb74d36c92391469d588dd7a37bc6 Mon Sep 17 00:00:00 2001
+From 239a465f3c0472cf199360487d0f78ca3bc9b488 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -64,7 +64,7 @@ procedures: mem/README.hg_malloc.md.
  globals.h                   |   25 +
  help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc.md     |  312 +++++
+ mem/README.hg_malloc.md     |  321 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
  mem/hg_arena.c              | 2346 +++++++++++++++++++++++++++++++++++
@@ -75,7 +75,7 @@ procedures: mem/README.hg_malloc.md.
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 1830 +++++++++++++++++++++++++++
+ mem/hg_malloc.c             | 1886 ++++++++++++++++++++++++++++
  mem/hg_malloc.h             | 1516 ++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
@@ -93,7 +93,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11650 insertions(+), 38 deletions(-)
+ 41 files changed, 11715 insertions(+), 38 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1050,10 +1050,10 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..f4c2a56ddc
+index 0000000000..dfa4ad249b
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
-@@ -0,0 +1,312 @@
+@@ -0,0 +1,321 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
@@ -1066,7 +1066,7 @@ index 0000000000..f4c2a56ddc
 +
 +**Blocks and the buddy allocator.** The arena is a grid of huge pages - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
 +
-+**Small arenas.** An arena whose initial size and cap are both below one huge page runs in small mode: 256 KB pages on plain 4 KB memory, at least 512 KB. With a cap of one huge page or more, the initial size must be at least one huge page.
++**Small arenas.** An arena with an INIT under one huge page settles its page size by the backing it gets. On plain 4 KB memory it runs in small mode, on 256 KB pages: at least 256 KB with a cap, 512 KB without. On huge pages its INIT is raised to one huge page, and an arena whose cap leaves no room above that page is refused at startup.
 +
 +**Idle caches are swept.** Every 30 s each process flushes what its private lists hold back to the shared pool (staggered, a process or two per second), keeping a small residue for the classes it is actively using. Without this, a worker that went idle would keep its cached cells forever.
 +
@@ -1091,7 +1091,7 @@ index 0000000000..f4c2a56ddc
 +
 +## 3. Elastic arenas
 +
-+`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size. With a cap of one huge page or more, INIT must be at least one huge page (2 MB on x86-64).
++`-m INIT:CAP` (and `-M INIT:CAP` for the private arenas) makes an arena elastic. Without a cap it is fixed at its size. For the smallest INIT see Small arenas (section 1).
 +
 +**One mapping, created before fork.** The whole cap is mapped once, shared, before any worker forks. Growth and shrink never create or change mappings - they populate and release ranges of that one shared object, which every process sees immediately. An untouched reserved range costs only page-table entries.
 +
@@ -1196,7 +1196,9 @@ index 0000000000..f4c2a56ddc
 +| startup: `RLIMIT_MEMLOCK is N KB, but growing needs M KB locked` | memory lock limit too low for the arena's growth | `LimitMEMLOCK=infinity` in the unit |
 +| `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
 +| `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
-+| startup: `below the 2 MB minimum viable arena` | `-m`/`-M` INIT under one huge page with a cap of one huge page or more | INIT of at least 2 MB, or keep both INIT and cap under 2 MB |
++| startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
++| startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
++| notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 +| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
@@ -1219,7 +1221,14 @@ index 0000000000..f4c2a56ddc
 +| `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 +| `-M INIT[:CAP]` | private (per-process) arena, same form |
 +
-+Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 4m:16m`. With a cap of one huge page (2 MB on x86-64) or more, INIT must be at least one huge page; an arena whose INIT and cap are both under one huge page runs in small mode on 4 KB pages, at least 512 KB. Without a cap the arena is fixed. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
++Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
++
++The smallest INIT depends on the backing the arena gets:
++
++- **Huge pages:** an arena holds at least one whole huge page (2 MB on x86-64). A smaller INIT is raised to it, with a notice. If the cap leaves no room above that page (`-M 1m:2m`), OpenSIPS refuses to start.
++- **Plain 4 KB pages:** the arena runs on 256 KB pages. INIT can be 256 KB when a cap gives it room to grow (`-M 256k:2m`), 512 KB without one.
++
++These are the allocator's limits, not OpenSIPS's needs: the shared arena must also fit core startup, which makes one allocation of about 540 KB, so give `-m` a cap of 2 MB or more. With a cap, an allocation that would fail commits one more grow step and retries, up to the cap. The cap is on the command line because the reservation is made before the configuration is parsed.
 +
 +### Memory autoscaling profiles
 +
@@ -6685,10 +6694,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..49a778484a
+index 0000000000..9351f6ee3f
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,1830 @@
+@@ -0,0 +1,1886 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -6834,7 +6843,8 @@ index 0000000000..49a778484a
 + * page was tried and measured failing on exactly those ("class 19 wants a
 + * 98432 byte chunk, larger than the 65536 byte page"). 256 KB clears every
 + * fixed cost; with the ~31 KB hg_block header on page 0, TWO pages
-+ * (512 KB) is the honest minimum in this mode.
++ * (512 KB) is the honest minimum for a fixed arena in this mode, and one
++ * page for an elastic one, which grows past it on first use.
 + *
 + * In huge-page mode the minimum is ONE system huge page, not two: the
 + * reserve floor, buddy order math and metadata carve were all verified
@@ -6843,7 +6853,9 @@ index 0000000000..49a778484a
 +#define HG_SMALL_PAGE_SHIFT 18
 +#define HG_SMALL_PAGE (1UL << HG_SMALL_PAGE_SHIFT)
 +
-+/* the page unit an arena with this init/cap runs on */
++/* the page unit an arena with this init/cap runs on, judged by size;
++ * an INIT under one huge page with a larger cap is settled by the backing
++ * tier in hg_malloc_init_cap() */
 +static inline unsigned long hg_arena_page(unsigned long init_b,
 +		unsigned long cap_b)
 +{
@@ -7969,6 +7981,8 @@ index 0000000000..49a778484a
 +	unsigned long cap, apage;
 +	char *base;
 +	struct hg_block *hb;
++	int tier_decides;
++	unsigned long cap_asked, mv;
 +
 +	/* The reservation may exceed the committed size, by admin cap.
 +	 * cap comes back as what was actually achieved (a hugetlb pool that
@@ -7991,19 +8005,66 @@ index 0000000000..49a778484a
 +	else
 +		cap = 0;
 +	apage = hg_arena_page(size, cap);
-+	if (size < hg_min_viable(apage)) {
++	/* INIT under one huge page with a cap at or above it: the backing the
++	 * arena gets decides the page unit, so the reservation is made on the
++	 * huge-page grid and INIT is settled once the tier is known (below) */
++	tier_decides = (apage == HG_HPS && size < HG_HPS);
++	/* a small-mode arena with room above it can start on one page: what
++	 * does not fit grows the arena instead of failing */
++	mv = (apage < HG_HPS && cap > hg_page_round(size, apage)) ?
++		apage : hg_min_viable(apage);
++	if (!tier_decides && size < mv) {
 +		LM_ERR("%s arena: %lu %s is below the %lu %s minimum viable "
 +			"arena\n", name, HG_SZ_VAL(size), HG_SZ_UNIT(size),
-+			HG_SZ_VAL(hg_min_viable(apage)),
-+			HG_SZ_UNIT(hg_min_viable(apage)));
++			HG_SZ_VAL(mv), HG_SZ_UNIT(mv));
 +		return NULL;
 +	}
++	cap_asked = cap;
 +	base = hg_mem_reserve(size, &cap, &tier, &locked_b, shared,
 +		(flags & HG_INIT_INHERITED) != 0, apage);
 +	if (!base) {
 +		LM_ERR("failed to reserve %lu bytes for %s HG_MALLOC arena\n",
 +			size, name);
 +		return NULL;
++	}
++
++	if (tier_decides && tier != HG_MEM_4K) {
++		/* huge pages come in whole pages: INIT is one of them. Refused
++		 * only when the cap ASKED for leaves no room above that page; a
++		 * hugetlb pool too small for the cap already said so and made
++		 * the arena fixed. */
++		if (hg_page_round(cap_asked, HG_HPS) <= HG_HPS) {
++			LM_ERR("%s arena: on huge pages INIT is at least one huge "
++				"page (%lu %s), which leaves no room to grow under the "
++				"%lu %s cap - raise the cap, or give INIT as %lu %s for "
++				"a fixed arena\n", name, HG_SZ_VAL(HG_HPS),
++				HG_SZ_UNIT(HG_HPS), HG_SZ_VAL(cap_asked),
++				HG_SZ_UNIT(cap_asked),
++				HG_SZ_VAL(HG_HPS), HG_SZ_UNIT(HG_HPS));
++			munmap(base, cap);
++			return NULL;
++		}
++		LM_NOTICE("%s arena: INIT raised from %lu %s to %lu %s - on huge "
++			"pages an arena holds at least one whole page\n", name,
++			HG_SZ_VAL(size), HG_SZ_UNIT(size), HG_SZ_VAL(HG_HPS),
++			HG_SZ_UNIT(HG_HPS));
++		size = HG_HPS;
++	} else if (tier_decides) {
++		/* plain 4K pages: run the grid on small pages up to the cap, and
++		 * hand back the part of the first huge page the reservation
++		 * pre-faulted beyond INIT */
++		unsigned long keep = hg_page_round(size, HG_SMALL_PAGE);
++
++		/* one small page is enough here: the cap is at least a huge
++		 * page above it, so the first allocations that do not fit grow
++		 * the arena instead of failing */
++		if (locked_b > keep) {
++			munlock(base + keep, locked_b - keep);
++			locked_b = keep;
++		}
++		madvise(base + keep, HG_HPS - keep,
++			shared ? MADV_REMOVE : MADV_DONTNEED);
++		apage = HG_SMALL_PAGE;
 +	}
 +
 +	/* the block header itself lives inside the reservation it describes */
@@ -8461,7 +8522,11 @@ index 0000000000..49a778484a
 +	}
 +	if (cap_bytes < init_bytes)
 +		cap_bytes = init_bytes;
-+	if (init_bytes < hg_min_viable(hg_arena_page(init_bytes, cap_bytes))) {
++	/* an INIT under one huge page with a cap at or above it is settled
++	 * by hg_malloc_init_cap() once the backing tier is known */
++	if (!(hg_arena_page(init_bytes, cap_bytes) == HG_HPS &&
++	      init_bytes < HG_HPS) &&
++	    init_bytes < hg_min_viable(hg_arena_page(init_bytes, cap_bytes))) {
 +		unsigned long mv =
 +			hg_min_viable(hg_arena_page(init_bytes, cap_bytes));
 +
