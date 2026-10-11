@@ -4,9 +4,9 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 
 ## Why
 
-- **Less CPU per call:** 10-30% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second.
-- **No drops under load:** 0 UDP drops at 60k cps, where every other allocator drops 160,000 or more; the workers keep the socket drained.
-- **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 11-28 s for the others.
+- **Less CPU per call:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second, and about half on a registrar taking 60k registrations per second.
+- **No drops under load:** 0 UDP drops and 0 failed calls at 60k cps, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; the workers keep the socket drained.
+- **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
 - **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
