@@ -51,6 +51,18 @@ The 60,000 point again with `-m 4096 -M 32` (HG_MALLOC `-m 128:4096 -M 16:32`), 
 
 No arm logged a memory error. F_MALLOC peaked at 2,467 MB, more than the 2 GB of the first run, and still failed 4,412 calls whose retransmissions were all dropped; HP_MALLOC's slowest probe INVITE took 1.3 s. HG_MALLOC grew to the same 1,536 MB as with the 2 GB cap, with no lock stall (longest hold 873 us); one client host retransmitted 8,485 times, and six probe INVITEs got their answer only from tm's reply retransmission 500 ms later, with no drop and no send error on the server.
 
+The same point once more with the host's CPU sampled by `mpstat` on the server over the measurement window, to see whether the drops come from a lack of CPU:
+
+| 60,000, `-m 4096` | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+|---|---|---|---|---|
+| OpenSIPS CPU, cores | 5.69 | 5.19 | 5.12 | **4.45** |
+| host idle | 63% (10.1 cores) | 68% (10.8) | 68% (10.9) | **72% (11.5)** |
+| kernel softirq | 4.5% | 4.1% | 4.2% | 4.3% |
+| UDP drops | 541,454 | 2,998 | 165,880 | **0** |
+| INVITE p99 (probe) | 14.9 ms | 10.2 ms | 8.4 ms | **2.4 ms** |
+
+The others drop with 10 or more of the 16 cores idle, so the workers are not short of CPU: they fall behind in bursts and the 8 MB socket buffer overflows. Drop counts vary between runs - F_MALLOC dropped 1,119,613 and 541,454 in the two runs at this point, HP_MALLOC 363,419 and 165,880 - while the order of the arms and HG_MALLOC's zero did not change.
+
 ## Memory under load
 
 Peak shared memory in the INVITE runs above, with the UDP drops of the same run:
@@ -93,7 +105,7 @@ In both HG runs the arena grew from 128 MB to 1,696 MB in 98 steps with no lock 
 
 - **Soak:** hgstress, 9 workers each doing 2 million stamped alloc/free pairs across every size class and the large tier, verifying stamps while the others churn: 0 torn words, 0 corruption, under fixed and elastic arenas.
 - **Fault injection:** a double free and a scribbled free-list link injected into a running process are both caught and counted (`double_free`, `foreign_ptr`), and the process keeps serving.
-- **Memory lock limit:** with `RLIMIT_MEMLOCK` at 64 KB and `CAP_IPC_LOCK` dropped, an elastic arena warns at startup, and its refused grows name the limit; with the limit lifted the same arena grows normally.
+- **Memory lock limit:** with `CAP_IPC_LOCK` dropped and `RLIMIT_MEMLOCK` at 64 MB, an elastic arena on 4 KB pages pins its 32 MB start, warns once, and keeps growing unpinned - to 368 MB under hgstress, with no failed allocation. On hugetlb pages, where growth needs the lock, refused grows name the limit; with the limit lifted the arena grows normally.
 
 ## Builds
 

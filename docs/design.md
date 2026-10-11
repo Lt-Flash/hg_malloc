@@ -69,7 +69,7 @@ The host-memory check charges a private-arena step once per OpenSIPS process, si
 
 The same floor guards the INITs: at startup every process's private arena is checked against the pool and RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](configuration.md#host-memory-checks)).
 
-Every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too. An elastic arena warns at startup when the limit cannot cover its growth, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4, an arena that could not pin its initial size runs unpinned, and its grows are populated without pinning instead of refused (section 8).
+On hugetlb pages every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too, so there a low limit refuses growth: the arena warns at startup, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4 the pin is a latency guarantee, not a requirement: an arena that could not pin its initial size runs unpinned, and a grow the limit cannot cover continues unpinned instead of being refused (section 8).
 
 ### 3.3 GROW-BLOCKED
 
@@ -127,7 +127,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 
 ## 7. Sizing
 
-1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required on every tier for an elastic arena.
+1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required for an elastic arena on hugetlb pages; recommended on the other tiers, where without it the arena runs unpinned and can be swapped.
 2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x processes`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late processes to THP.
    **Tiers 2-3 instead of a pool:** THP `enabled` = `madvise` or `always` (private arenas) and `shmem_enabled` = `advise` or `always` (shared arena). With neither a pool nor THP, every arena runs on 4 KB pages.
 3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
@@ -139,7 +139,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 
 | symptom | cause | fix |
 |---|---|---|
-| startup: `RLIMIT_MEMLOCK is N KB, but growing needs M KB locked` | memory lock limit too low for the arena's growth | `LimitMEMLOCK=infinity` in the unit |
+| startup: `RLIMIT_MEMLOCK is N KB, but growing on hugetlb pages needs M KB locked` | memory lock limit too low for growth on hugetlb pages | `LimitMEMLOCK=infinity` in the unit |
 | `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
 | `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
 | startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
@@ -150,7 +150,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 | `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 | `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
-| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
+| startup: `RLIMIT_MEMLOCK is N KB, less than the ... cap`, `continuing unpinned`, or `cannot pin a ... grow` | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity` to keep the arena pinned; meanwhile it grows unpinned (swappable) rather than refusing |
 | grown pages on 4 KB on a THP host | each step negotiates its own backing | expected; see `tier_bytes`, or use tier 1 |
 | never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `core:hg_stats`; enable `hg_interior_release` to release from inside the arena |
 | `DRY RUN - would grow` and allocations fail past the initial size | `hg_autoscale_dry_run = 1` blocks all growth | set 0 to act |

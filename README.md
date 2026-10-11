@@ -47,7 +47,7 @@ opensips -f opensips.cfg -a HG_MALLOC -m 512 -M 16
 opensips -f opensips.cfg -a HG_MALLOC -m 128:1024 -M 16:32
 ```
 
-The service needs an unlimited memory-lock limit, because the committed arena is pinned and every grow is an `mlock()`:
+The arena is pinned so it cannot be swapped; give the service an unlimited memory-lock limit:
 
 ```ini
 # systemd unit
@@ -55,7 +55,7 @@ The service needs an unlimited memory-lock limit, because the committed arena is
 LimitMEMLOCK=infinity
 ```
 
-HG warns at startup, and under `opensips -C`, when the limit cannot cover the arena's growth.
+On hugetlb pages an elastic arena needs it to grow at all; on THP and 4 KB pages HG runs and grows unpinned without it. HG warns at startup, and under `opensips -C`, when the limit is too low.
 
 **Enable huge pages on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
 

@@ -1,4 +1,4 @@
-From 1d8a173bffb52f02e82e501c8843e5ede3eca043 Mon Sep 17 00:00:00 2001
+From c75208446d7db872b4bc4fe76466dc0f31d4c121 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -33,10 +33,12 @@ existing configurations.
    fit, warn for the auto-scaling maximum and for caps beyond MemTotal),
    before each fork (an auto-scaler fork that does not fit is skipped),
    and on each arena creation and grow.
- - Every grow is an mlock() of the new range, and mlock() checks
-   RLIMIT_MEMLOCK on hugetlb as well: the arena warns at startup (and under
-   -C) when the limit cannot cover its growth, and a refused grow names the
-   resource that ran out - the limit or the hugetlb pool.
+ - On hugetlb pages every grow is an mlock() of the new range, and mlock()
+   checks RLIMIT_MEMLOCK there as well: the arena warns at startup (and
+   under -C) when the limit cannot cover its growth, and a refused grow
+   names the resource that ran out - the limit or the hugetlb pool. On 4 KB
+   and THP pages a limit too low to pin the arena leaves it running and
+   growing unpinned (swappable) instead.
  - core:hg_stats (MI) per arena: tier, committed/reserved, per-class carve
    and reuse, grows/shrinks, lock hold/wait histograms per reason and the
    corruption counters; core:hg_advise (MI) recommends -m/-M from the peaks
@@ -82,7 +84,7 @@ procedures: mem/README.hg_malloc.md.
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 2183 +++++++++++++++++++++++++++++++
+ mem/hg_malloc.c             | 2214 ++++++++++++++++++++++++++++++++
  mem/hg_malloc.h             | 1584 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
@@ -101,7 +103,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 42 files changed, 12230 insertions(+), 39 deletions(-)
+ 42 files changed, 12261 insertions(+), 39 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1061,7 +1063,7 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..51ec0e2495
+index 0000000000..9b99ec6083
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
 @@ -0,0 +1,344 @@
@@ -1136,7 +1138,7 @@ index 0000000000..51ec0e2495
 +
 +The same floor guards the INITs: at startup every process's private arena is checked against the pool and RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
 +
-+Every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too. An elastic arena warns at startup when the limit cannot cover its growth, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4, an arena that could not pin its initial size runs unpinned, and its grows are populated without pinning instead of refused (section 8).
++On hugetlb pages every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too, so there a low limit refuses growth: the arena warns at startup, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4 the pin is a latency guarantee, not a requirement: an arena that could not pin its initial size runs unpinned, and a grow the limit cannot cover continues unpinned instead of being refused (section 8).
 +
 +### 3.3 GROW-BLOCKED
 +
@@ -1194,7 +1196,7 @@ index 0000000000..51ec0e2495
 +
 +## 7. Sizing
 +
-+1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required on every tier for an elastic arena.
++1. **Memory lock limit:** `LimitMEMLOCK=infinity` in the service unit (or `ulimit -l unlimited`). Required for an elastic arena on hugetlb pages; recommended on the other tiers, where without it the arena runs unpinned and can be swapped.
 +2. **Tier 1 pool:** reserve `shm_cap + pkg_cap x processes`, in 2 MB pages, plus a margin of about 12%. A pool that cannot fit the caps gives fixed arenas on huge pages, or pushes late processes to THP.
 +   **Tiers 2-3 instead of a pool:** THP `enabled` = `madvise` or `always` (private arenas) and `shmem_enabled` = `advise` or `always` (shared arena). With neither a pool nor THP, every arena runs on 4 KB pages.
 +3. **Private caps multiply:** `-M 16:64` on 30 processes is up to 1.9 GB of potential pinned growth.
@@ -1206,7 +1208,7 @@ index 0000000000..51ec0e2495
 +
 +| symptom | cause | fix |
 +|---|---|---|
-+| startup: `RLIMIT_MEMLOCK is N KB, but growing needs M KB locked` | memory lock limit too low for the arena's growth | `LimitMEMLOCK=infinity` in the unit |
++| startup: `RLIMIT_MEMLOCK is N KB, but growing on hugetlb pages needs M KB locked` | memory lock limit too low for growth on hugetlb pages | `LimitMEMLOCK=infinity` in the unit |
 +| `cannot grow ...: RLIMIT_MEMLOCK is N KB` | the same, at grow time | the same |
 +| `hugetlb pool cannot back a ... cap` at startup | `vm.nr_hugepages` smaller than the caps | grow the pool (section 7), restart |
 +| startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
@@ -1217,7 +1219,7 @@ index 0000000000..51ec0e2495
 +| `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
-+| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
++| startup: `RLIMIT_MEMLOCK is N KB, less than the ... cap`, `continuing unpinned`, or `cannot pin a ... grow` | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity` to keep the arena pinned; meanwhile it grows unpinned (swappable) rather than refusing |
 +| grown pages on 4 KB on a THP host | each step negotiates its own backing | expected; see `tier_bytes`, or use tier 1 |
 +| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `core:hg_stats`; enable `hg_interior_release` to release from inside the arena |
 +| `DRY RUN - would grow` and allocations fail past the initial size | `hg_autoscale_dry_run = 1` blocks all growth | set 0 to act |
@@ -1307,7 +1309,7 @@ index 0000000000..51ec0e2495
 +
 +#### E_CORE_SHM_GROW_BLOCKED
 +
-+The shared arena needs to grow and a resource refuses: the memory-lock limit, the hugetlb pool, or the host floor (`hg_ram_floor_mb`). Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
++The shared arena needs to grow and a resource refuses: the memory-lock limit (on hugetlb pages), the hugetlb pool, or the host floor (`hg_ram_floor_mb`). Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
 +
 +| parameter | meaning |
 +|---|---|
@@ -1389,7 +1391,7 @@ index 0000000000..51ec0e2495
 +
 +### Host requirements
 +
-+- `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`: the committed arena is pinned and every grow is an `mlock()`, which checks the limit on hugetlb mappings too. HG warns at startup when the limit cannot cover growth, and a refused grow names the limit or the hugetlb pool, whichever ran out. On tiers 2-4, an arena that could not pin its initial size runs unpinned and grows without pinning instead of refusing.
++- `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`, so the arena stays pinned. Required for an elastic arena on hugetlb pages: every grow there is an `mlock()`, which checks the limit on hugetlb mappings too, and a refused grow names the limit or the hugetlb pool, whichever ran out. Recommended on tiers 2-4: without it the arena runs and grows unpinned (swappable) instead of refusing. HG warns at startup when the limit is too low.
 +- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
 +  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
 +  - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
@@ -6799,10 +6801,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..5856bdc6ad
+index 0000000000..291f568d18
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,2183 @@
+@@ -0,0 +1,2214 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7870,6 +7872,29 @@ index 0000000000..5856bdc6ad
 +			mlock_rc = 0;
 +		} else {
 +			HG_CP_TIME(HG_CP_MLOCK, mlock_rc = mlock(base, delta));
++			if (mlock_rc != 0 && hg_memlock_limit()) {
++				/* 4 KB and THP memory is swappable, so the pin is a
++				 * latency guarantee here, not a requirement: a grow
++				 * the memory-lock limit cannot cover goes on unpinned,
++				 * as an arena that could not pin at init already does.
++				 * Refusing it made a limit high enough to pin INIT
++				 * fail growth that a lower limit let through. A
++				 * failure with no binding limit is a real resource
++				 * refusal and still refuses below; hugetlb grows
++				 * still need the lock (above). */
++				munlock(base, delta);
++				LM_WARN("%s: RLIMIT_MEMLOCK (%lu KB) cannot pin a %lu MB "
++					"grow - the arena continues unpinned (swappable). "
++					"Set LimitMEMLOCK=infinity in the service unit (or "
++					"ulimit -l unlimited) to keep it pinned.\n", hb->name,
++					hg_memlock_limit() >> 10, delta >> 20);
++				hb->unpinned = 1;
++				HG_CP_TIME(HG_CP_MLOCK, {
++					if (madvise(base, delta, MADV_POPULATE_WRITE) != 0)
++						memset(base, 0, delta);   /* pre-5.14 kernels */
++				});
++				mlock_rc = 0;
++			}
 +		}
 +		if (mlock_rc != 0) {
 +			/* once per episode - see grow_refuse_said's comment */
@@ -8607,25 +8632,33 @@ index 0000000000..5856bdc6ad
 +	 * arena cannot keep - and it surfaces only at the first refused grow,
 +	 * possibly hours into traffic. Say so now, where the operator (and a
 +	 * -C config check) sees it. On hugetlb the limit is checked per grow
-+	 * against one delta plus whatever else the process has locked; on the
-+	 * other tiers every committed byte counts, so the whole cap must fit.
++	 * against one delta plus whatever else the process has locked, and a
++	 * grow it refuses fails; on the other tiers every committed byte
++	 * counts, so the whole cap must fit to stay pinned - past the limit
++	 * the arena keeps growing, unpinned (hg_mem_commit()).
 +	 */
 +	if (hb->hcap > hb->committed_bytes) {
 +		unsigned long lim = hg_memlock_limit();
 +		unsigned long need = (tier == HG_MEM_HUGETLB) ?
 +			hb->grow_granule : hb->hcap;
 +
-+		if (lim && lim < need)
++		if (lim && lim < need && tier == HG_MEM_HUGETLB)
 +			LM_WARN("%s arena: RLIMIT_MEMLOCK is %lu KB, but growing "
-+				"needs %lu KB locked (%s) - %s. Set "
++				"on hugetlb pages needs %lu KB locked (one grow "
++				"granule) - grows past the limit will be refused. Set "
 +				"LimitMEMLOCK=infinity in the service unit (or ulimit "
 +				"-l unlimited) before relying on the %lu %s cap.\n",
 +				name, lim >> 10, need >> 10,
-+				tier == HG_MEM_HUGETLB ? "one grow granule" :
-+				"the whole cap",
-+				hb->unpinned ? "the arena runs unpinned and grows "
-+				"without pinning" : "grows past the limit will be "
-+				"refused", HG_SZ_VAL(hb->hcap), HG_SZ_UNIT(hb->hcap));
++				HG_SZ_VAL(hb->hcap), HG_SZ_UNIT(hb->hcap));
++		else if (lim && lim < need)
++			LM_WARN("%s arena: RLIMIT_MEMLOCK is %lu KB, less than the "
++				"%lu %s cap - %s, so the arena can be swapped. Set "
++				"LimitMEMLOCK=infinity in the service unit (or ulimit "
++				"-l unlimited) to keep it pinned.\n",
++				name, lim >> 10, HG_SZ_VAL(hb->hcap),
++				HG_SZ_UNIT(hb->hcap), hb->unpinned ? "it runs unpinned "
++				"and grows without pinning" : "grows past the limit "
++				"continue unpinned");
 +	}
 +
 +	return hb;
