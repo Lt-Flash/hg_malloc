@@ -55,7 +55,7 @@ The arena is pinned so it cannot be swapped; give the service an unlimited memor
 LimitMEMLOCK=infinity
 ```
 
-On hugetlb pages an elastic arena needs it to grow at all; on THP and 4 KB pages HG runs and grows unpinned without it. HG warns at startup, and under `opensips -C`, when the limit is too low.
+With a lower limit, HG runs and grows unpinned on THP and 4 KB pages, but on hugetlb pages an elastic arena cannot grow past the limit. HG warns at startup, and under `opensips -C`, when the limit is too low.
 
 **Enable huge pages on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
 
