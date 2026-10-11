@@ -1,4 +1,4 @@
-From a39bc476c8cdb3b518a6ded90188a0df040e49b8 Mon Sep 17 00:00:00 2001
+From 112cb9d6f45bfbe2c87829abec3680b4bfcd388d Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 10:42:53 +1100
 Subject: [PATCH 1/2] mem: HG_MALLOC - hugepage-backed slab allocator with
@@ -43,7 +43,8 @@ Builds clean with gcc and clang -Werror, with HG_MALLOC compiled out, on
 arm32/arm64, i386 and musl. Design, configuration, deployment and test
 procedures: mem/README.hg_malloc_v3.md.
 ---
- Makefile.defs              |    6 +
+ Makefile.conf.template     |    6 +
+ Makefile.defs              |    3 +
  cfg.lex                    |   33 +
  cfg.y                      |  161 ++-
  core_stats.c               |  301 +++++
@@ -73,15 +74,15 @@ procedures: mem/README.hg_malloc_v3.md.
  mem/mem.h                  |   12 +
  mem/mem_arena.h            |  125 ++
  mem/shm_mem.c              |  160 ++-
- mem/shm_mem.h              |   51 +-
- mi/mi_core.c               |  726 +++++++++++
+ mem/shm_mem.h              |   45 +-
+ mi/mi_core.c               |  730 +++++++++++
  pt.c                       |  113 ++
  pt_scaling.c               |   22 +-
  pt_scaling.h               |    5 +
  socket_info.c              |   16 +
  statistics.c               |    9 +
  version.h                  |    9 +-
- 38 files changed, 10977 insertions(+), 36 deletions(-)
+ 39 files changed, 10979 insertions(+), 35 deletions(-)
  create mode 100644 mem/README.hg_malloc_v3.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -97,31 +98,34 @@ procedures: mem/README.hg_malloc_v3.md.
  create mode 100644 mem/hg_version.h
  create mode 100644 mem/mem_arena.h
 
+diff --git a/Makefile.conf.template b/Makefile.conf.template
+index c6396cc5f4..3202234950 100644
+--- a/Makefile.conf.template
++++ b/Makefile.conf.template
+@@ -97,6 +97,12 @@ DEFS+= -DQ_MALLOC #Quality assurance memory allocator with runtime safety checks
+ DEFS+= -DHP_MALLOC #High performance allocator with fine-grained locking
+ DEFS+= -DDBG_MALLOC #Include additional, debug-enabled allocator flavors
+ DEFS+= -DF_PARALLEL_MALLOC #Fast memory allocator with paralel buckets
++DEFS+= -DHG_MALLOC #Slab allocator with a lock-free fast path and elastic arenas
++# HG_MALLOC: select with -a HG_MALLOC. -m/-M accept INIT:CAP, e.g. -m 128:1024:
++# start at 128 MB, grow on demand up to 1 GB, give memory back when idle.
++# Uses huge pages when the host has them (hugetlb pool or THP), else 4 KB
++# pages. The committed arena is mlock()ed: run with LimitMEMLOCK=infinity.
++# See mem/README.hg_malloc_v3.md
+ #DEFS+= -DQM_DBG_MALLOC_HIST=3 #Size of debug history for Q_MALLOC (default is 1)
+ #DEFS+= -DNO_DEBUG #Compile out all debug messages
+ #DEFS+= -DNO_LOG #Compile out all logging
 diff --git a/Makefile.defs b/Makefile.defs
-index ab003c6a89..5bc5dcbc8d 100644
+index ab003c6a89..1047a239fc 100644
 --- a/Makefile.defs
 +++ b/Makefile.defs
-@@ -524,10 +524,12 @@ endif
- ifeq (,$(findstring F_MALLOC, $(DEFS)))
- ifeq (,$(findstring Q_MALLOC, $(DEFS)))
- ifeq (,$(findstring HP_MALLOC, $(DEFS)))
-+ifeq (,$(findstring HG_MALLOC, $(DEFS)))
- 	DEFS+= -DQ_MALLOC
- endif
- endif
- endif
-+endif
- 
- ifneq (,$(MEM_STATS_HDR))
- EXPECTED_MD5=$(shell [ -f $(MEM_STATS_HDR) ] && tail -n 1 $(MEM_STATS_HDR) | awk '{print $$4}')
-@@ -558,6 +560,10 @@ MKTAGS=ctags -R .
+@@ -558,6 +558,9 @@ MKTAGS=ctags -R .
  #		decently fast allocator with extra sanity checks + safety buffers
  # -DHP_MALLOC
  #		high performance allocator optimized for shared memory multiprocessing
 +# -DHG_MALLOC
-+#		hugepage-backed slab allocator; fixed size classes bump-carved from
-+#		its own huge-page (or best-effort degraded) reservation, no fallback
-+#		to another allocator on exhaustion - increase -m/-M instead
++#		slab allocator with a lock-free fast path and elastic arenas
++#		(-m INIT:CAP), on huge pages when the host provides them
  # -DDBG_MALLOC
  #       will cause each of the enabled allocators to also include a "debugging"
  #       flavor of itself;  by running a debugging version of an allocator, you
@@ -6559,7 +6563,7 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..0834bd360a
+index 0000000000..6fb2167832
 --- /dev/null
 +++ b/mem/hg_malloc.c
 @@ -0,0 +1,1828 @@
@@ -7902,8 +7906,8 @@ index 0000000000..0834bd360a
 +	hb->span_pending = hb->span_end;
 +	hb->hcap = cap;
 +	/* one committed-size step per grow: big enough that a growth spurt is
-+	 * a handful of commits, small enough that the pre-fault under the
-+	 * arena lock stays bounded. A small-mode arena steps one of its own
++	 * a handful of commits, small enough that one commit's pre-fault
++	 * stays bounded. A small-mode arena steps one of its own
 +	 * 256 KB pages at a time - a 16 MB granule would overshoot its whole
 +	 * cap. Overridable by config later. */
 +	hb->grow_granule = apage < HG_HPS ?
@@ -10697,7 +10701,7 @@ index 9d6d9fd948..b8063460bd 100644
  	int j;
  
 diff --git a/mem/shm_mem.h b/mem/shm_mem.h
-index deaecc106a..bf1f4625e6 100644
+index deaecc106a..b08bc59663 100644
 --- a/mem/shm_mem.h
 +++ b/mem/shm_mem.h
 @@ -82,6 +82,14 @@
@@ -10748,7 +10752,7 @@ index deaecc106a..bf1f4625e6 100644
  #else
  #define SHM_MALLOC             gen_shm_malloc
  #define SHM_MALLOC_UNSAFE      gen_shm_malloc_unsafe
-@@ -286,11 +311,11 @@ inline static void shm_threshold_check(void)
+@@ -286,7 +311,7 @@ inline static void shm_threshold_check(void)
   #define shm_threshold_check()
  #endif
  
@@ -10757,23 +10761,7 @@ index deaecc106a..bf1f4625e6 100644
  	#ifdef INLINE_ALLOC
  	#define shm_lock()
  	#define shm_unlock()
--	#else
-+	#elif defined F_MALLOC || defined Q_MALLOC
- 	extern int shm_use_global_lock;
- 	#define shm_lock() \
- 		do { \
-@@ -302,6 +327,10 @@ inline static void shm_threshold_check(void)
- 			if (shm_use_global_lock) \
- 				lock_release(mem_lock); \
- 		} while (0)
-+	#else
-+	/* no allocator with a global lock is built in */
-+	#define shm_lock()
-+	#define shm_unlock()
- 	#endif
- 	extern unsigned long long *shm_hash_usage;
- #else
-@@ -840,6 +869,22 @@ inline static void shm_info(struct mem_info* mi)
+@@ -840,6 +865,22 @@ inline static void shm_info(struct mem_info* mi)
  
  inline static void shm_force_unlock(void)
  {
@@ -10797,7 +10785,7 @@ index deaecc106a..bf1f4625e6 100644
  #if defined F_MALLOC || defined Q_MALLOC
  		|| mem_lock
 diff --git a/mi/mi_core.c b/mi/mi_core.c
-index ce49333672..7ac2dcaa05 100644
+index ce49333672..611c724118 100644
 --- a/mi/mi_core.c
 +++ b/mi/mi_core.c
 @@ -44,6 +44,11 @@
@@ -10820,7 +10808,7 @@ index ce49333672..7ac2dcaa05 100644
  	}
  
  	return resp;
-@@ -982,6 +988,712 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
+@@ -982,6 +988,716 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
  
  
  
@@ -11402,6 +11390,7 @@ index ce49333672..7ac2dcaa05 100644
 +		reported++;
 +	}
 +
++#ifdef PKG_MALLOC
 +	if (mem_allocator_pkg == MM_HG_MALLOC ||
 +	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
 +		unsigned long peak = 0, sum = 0;
@@ -11423,6 +11412,7 @@ index ce49333672..7ac2dcaa05 100644
 +			goto error;
 +		reported++;
 +	}
++#endif
 +
 +	if (!reported) {
 +		free_mi_response(resp);
@@ -11472,6 +11462,7 @@ index ce49333672..7ac2dcaa05 100644
 +		reported++;
 +	}
 +
++#ifdef PKG_MALLOC
 +	if (mem_allocator_pkg == MM_HG_MALLOC ||
 +	    mem_allocator_pkg == MM_HG_MALLOC_DBG) {
 +		/*
@@ -11486,6 +11477,7 @@ index ce49333672..7ac2dcaa05 100644
 +			goto error;
 +		reported++;
 +	}
++#endif
 +
 +	/* module arenas (hg_arena_create): every registered shared block that
 +	 * is not the core shm block - they exist whatever -a says */
@@ -11533,7 +11525,7 @@ index ce49333672..7ac2dcaa05 100644
  static const mi_export_t mi_core_cmds[] = {
  	{ "pi_list", "lists the provisioning framework", 0, 0, {
  		{w_mi_pi_list, {0}},
-@@ -1005,6 +1717,20 @@ static const mi_export_t mi_core_cmds[] = {
+@@ -1005,6 +1721,20 @@ static const mi_export_t mi_core_cmds[] = {
  		{mi_pwd, {0}},
  		{EMPTY_MI_RECIPE}}, {0}
  	},
