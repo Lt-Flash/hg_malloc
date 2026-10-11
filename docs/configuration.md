@@ -87,7 +87,7 @@ The shared arena needs to grow and a resource refuses: the memory-lock limit, th
 | `cap_mb` | the `-m` cap - committed is below it, since a full arena does not raise this event |
 | `grow_refused` | refused grows so far |
 
-What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`hg_stats`, `hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
+What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
 
 ### E_CORE_HG_LOCK_STALL
 
@@ -101,7 +101,7 @@ A process held the shared arena's lock for `hg_lock_stall_us` (default 1000 us) 
 | `process` | OpenSIPS process number that held it, as listed by `opensips-cli -x mi ps` |
 | `stalls` | stalls since startup |
 
-What to do: an occasional stall during a growth spurt is normal. A steady stream, or one `reason` dominating, is worth a look at the per-reason hold histogram in `hg_stats`.
+What to do: an occasional stall during a growth spurt is normal. A steady stream, or one `reason` dominating, is worth a look at the per-reason hold histogram in `core:hg_stats`.
 
 ### Examples
 
@@ -140,7 +140,7 @@ opensips-cli -x mi core:hg_advise     # what -m and -M should be, from the peak 
 opensips-cli -x mi statistics:get hgmem:
 ```
 
-`hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `hg_advise` covers the worst process.
+`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process.
 
 The `hgmem:` statistics group holds the shared arena's figures, plus two that sum every process's private arena (each process publishes its own at its 30 s cache sweep). The ones worth alerting on:
 

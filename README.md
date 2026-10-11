@@ -68,7 +68,7 @@ echo madvise > /sys/kernel/mm/transparent_hugepage/enabled         # private are
 echo advise  > /sys/kernel/mm/transparent_hugepage/shmem_enabled   # shared arena (-m)
 ```
 
-Many distributions ship `shmem_enabled` as `never`, which puts the shared arena on 4 KB pages even when THP is on for private memory. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later. The startup log names the tier each arena got, and, when THP is off by a host setting, why it fell to 4 KB pages; `hg_stats` shows the split in `tier_bytes` when growth landed on more than one tier.
+Many distributions ship `shmem_enabled` as `never`, which puts the shared arena on 4 KB pages even when THP is on for private memory. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later. The startup log names the tier each arena got, and, when THP is off by a host setting, why it fell to 4 KB pages; `core:hg_stats` shows the split in `tier_bytes` when growth landed on more than one tier.
 
 Grow ahead of demand and give memory back with a profile - [configuration](docs/configuration.md):
 

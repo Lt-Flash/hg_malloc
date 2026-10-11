@@ -14,7 +14,7 @@ How HG_MALLOC works, what it guarantees, and how to run and monitor it. For the 
 
 **Idle caches are swept.** Every 30 s each process flushes what its private lists hold back to the shared pool (staggered, a process or two per second), keeping a small residue for the classes it is actively using. Without this, a worker that went idle would keep its cached cells forever.
 
-**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `hg_stats` (`corruption`) and logged at CRITICAL on each detection; the process keeps running. Detection happens when the second copy reaches the shared pool: a cell freed twice and taken again by the same process before its next flush is not caught.
+**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `core:hg_stats` (`corruption`) and logged at CRITICAL on each detection; the process keeps running. Detection happens when the second copy reaches the shared pool: a cell freed twice and taken again by the same process before its next flush is not caught.
 
 ## 2. Backing memory
 
@@ -29,7 +29,7 @@ The arena is acquired through four tiers, best first, each verified from the ker
 
 Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and says why when THP is turned off by a host setting. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
 
-**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
+**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
 
 **Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). If the pool can hold the initial size but not the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup. If it cannot hold even the initial size, the arena starts on THP with its full cap and stays elastic.
 
@@ -152,7 +152,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 | arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
 | grown pages on 4 KB on a THP host | each step negotiates its own backing | expected; see `tier_bytes`, or use tier 1 |
-| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `hg_stats`; enable `hg_interior_release` to release from inside the arena |
+| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `core:hg_stats`; enable `hg_interior_release` to release from inside the arena |
 | `DRY RUN - would grow` and allocations fail past the initial size | `hg_autoscale_dry_run = 1` blocks all growth | set 0 to act |
 | testing under `ulimit -l` shows no refusals | running as root: `CAP_IPC_LOCK` lifts the limit | test as an unprivileged user (`setpriv`) |
 

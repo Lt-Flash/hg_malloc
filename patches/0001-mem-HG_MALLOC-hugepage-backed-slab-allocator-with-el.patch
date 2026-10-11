@@ -1,4 +1,4 @@
-From 9f140e2d381488c48fe3163273b58e4e499ace82 Mon Sep 17 00:00:00 2001
+From efbc24e243d38b5d70bed685d9ec82d2b32c96f6 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -74,7 +74,7 @@ procedures: mem/README.hg_malloc.md.
  mem/README.hg_malloc.md     |  344 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
- mem/hg_arena.c              | 2373 +++++++++++++++++++++++++++++++++++
+ mem/hg_arena.c              | 2406 +++++++++++++++++++++++++++++++++++
  mem/hg_arena.h              |  136 ++
  mem/hg_buddy.c              | 1651 ++++++++++++++++++++++++
  mem/hg_buddy.h              |  249 ++++
@@ -83,7 +83,7 @@ procedures: mem/README.hg_malloc.md.
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
  mem/hg_malloc.c             | 2161 +++++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1580 +++++++++++++++++++++++
+ mem/hg_malloc.h             | 1581 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -91,7 +91,7 @@ procedures: mem/README.hg_malloc.md.
  mem/mem_arena.h             |  125 ++
  mem/shm_mem.c               |  160 ++-
  mem/shm_mem.h               |   45 +-
- mi/mi_core.c                |  730 +++++++++++
+ mi/mi_core.c                |  731 +++++++++++
  modules/hgstress/Makefile   |    9 +
  modules/hgstress/hgstress.c |  576 +++++++++
  opensips.8                  |   33 +-
@@ -101,7 +101,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 42 files changed, 12163 insertions(+), 39 deletions(-)
+ 42 files changed, 12198 insertions(+), 39 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1059,7 +1059,7 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..c532035667
+index 0000000000..71d91f2d79
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
 @@ -0,0 +1,344 @@
@@ -1079,7 +1079,7 @@ index 0000000000..c532035667
 +
 +**Idle caches are swept.** Every 30 s each process flushes what its private lists hold back to the shared pool (staggered, a process or two per second), keeping a small residue for the classes it is actively using. Without this, a worker that went idle would keep its cached cells forever.
 +
-+**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `hg_stats` (`corruption`) and logged at CRITICAL on each detection; the process keeps running. Detection happens when the second copy reaches the shared pool: a cell freed twice and taken again by the same process before its next flush is not caught.
++**Integrity checks at the pool boundary.** Each block keeps a map of which of its cells are in the shared pool. A cell that reaches the pool twice is an exact double free: the second copy is refused and counted. Every link the pool follows is checked against the map, so a scribbled free-list link stops the walk instead of leading it off the arena. Both are counted in `core:hg_stats` (`corruption`) and logged at CRITICAL on each detection; the process keeps running. Detection happens when the second copy reaches the shared pool: a cell freed twice and taken again by the same process before its next flush is not caught.
 +
 +## 2. Backing memory
 +
@@ -1094,7 +1094,7 @@ index 0000000000..c532035667
 +
 +Tiers 2-4 pin the committed arena with `mlock()`. The startup log names the tier achieved, and says why when THP is turned off by a host setting. Huge pages make the allocator's own work cheaper but are not required; an arena on 4 KB pages behaves the same.
 +
-+**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
++**Each growth step negotiates its own backing.** A step may land on a different tier than the memory before it, so `core:hg_stats` reports `tier_bytes` - the split by tier - whenever more than one tier holds bytes.
 +
 +**Tier 1 reserves the whole cap from the pool when the arena is created.** Growth on tier 1 therefore cannot fail half-way, and the pool must be sized for the caps (section 7). If the pool can hold the initial size but not the cap, the arena keeps huge pages at its initial size, cannot grow, and says so at startup. If it cannot hold even the initial size, the arena starts on THP with its full cap and stays elastic.
 +
@@ -1217,7 +1217,7 @@ index 0000000000..c532035667
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 +| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
 +| grown pages on 4 KB on a THP host | each step negotiates its own backing | expected; see `tier_bytes`, or use tier 1 |
-+| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `hg_stats`; enable `hg_interior_release` to release from inside the arena |
++| never shrinks | usage above the down-threshold, inside the post-grow cool-off, a profile without `scale down`, or the top page in use | check `core:hg_stats`; enable `hg_interior_release` to release from inside the arena |
 +| `DRY RUN - would grow` and allocations fail past the initial size | `hg_autoscale_dry_run = 1` blocks all growth | set 0 to act |
 +| testing under `ulimit -l` shows no refusals | running as root: `CAP_IPC_LOCK` lifts the limit | test as an unprivileged user (`setpriv`) |
 +
@@ -1314,7 +1314,7 @@ index 0000000000..c532035667
 +| `cap_mb` | the `-m` cap - committed is below it, since a full arena does not raise this event |
 +| `grow_refused` | refused grows so far |
 +
-+What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`hg_stats`, `hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
++What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
 +
 +#### E_CORE_HG_LOCK_STALL
 +
@@ -1328,7 +1328,7 @@ index 0000000000..c532035667
 +| `process` | OpenSIPS process number that held it, as listed by `opensips-cli -x mi ps` |
 +| `stalls` | stalls since startup |
 +
-+What to do: an occasional stall during a growth spurt is normal. A steady stream, or one `reason` dominating, is worth a look at the per-reason hold histogram in `hg_stats`.
++What to do: an occasional stall during a growth spurt is normal. A steady stream, or one `reason` dominating, is worth a look at the per-reason hold histogram in `core:hg_stats`.
 +
 +#### Examples
 +
@@ -1367,7 +1367,7 @@ index 0000000000..c532035667
 +opensips-cli -x mi statistics:get hgmem:
 +```
 +
-+`hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `hg_advise` covers the worst process.
++`core:hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `core:hg_advise` covers the worst process.
 +
 +The `hgmem:` statistics group holds the shared arena's figures, plus two that sum every process's private arena (each process publishes its own at its 30 s cache sweep). The ones worth alerting on:
 +
@@ -1518,10 +1518,10 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..693d6a4271
+index 0000000000..c53d33316b
 --- /dev/null
 +++ b/mem/hg_arena.c
-@@ -0,0 +1,2373 @@
+@@ -0,0 +1,2406 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -2287,6 +2287,15 @@ index 0000000000..693d6a4271
 + * too: recovery is a rise in free leaves, and nothing on the alloc path can
 + * observe that.
 + *
++ * Only a crossing the arena cannot grow out of is a WARN. An elastic arena
++ * below its ceiling crosses the floor on every step of normal growth - 44-58
++ * times in a 60 s run at 20k-60k cps - and "raise -m/-M" is wrong advice
++ * there. The sweep happens either way; the log level follows whether the
++ * admin has anything to act on: at the ceiling (the -m/-M cap or the
++ * profile's scale-up target, as in the grow path) or with growth blocked.
++ * A quiet crossing that then grows into the ceiling, or gets blocked, while
++ * still below the floor is upgraded to the WARN once, with one more sweep.
++ *
 + * hb->lock is held by every caller.
 + */
 +/*
@@ -2322,6 +2331,14 @@ index 0000000000..693d6a4271
 +		hb->hi = b + size;
 +}
 +
++static inline int hg_floor_stuck(struct hg_block *hb)
++{
++	unsigned long limit = (hb->pol.active && hb->pol.up_bytes) ?
++		hb->pol.up_bytes : hb->hcap;
++
++	return hb->committed_bytes >= limit || hb->grow_blocked;
++}
++
 +void hg_reserve_floor_check(struct hg_block *hb)
 +{
 +	if (!hb->buddy_ready || !hb->reserve_floor)
@@ -2331,18 +2348,34 @@ index 0000000000..693d6a4271
 +		if (!hb->below_floor) {
 +			hb->below_floor = 1;
 +			hb->floor_crossings++;
-+			hg_sweep_gen++;
++		} else if (hb->floor_warned || !hg_floor_stuck(hb)) {
++			return;
++		}
++		hg_sweep_gen++;
++		if (hg_floor_stuck(hb)) {
++			hb->floor_warned = 1;
 +			LM_WARN("%s: free space fell below the reserve floor "
 +				"(%lu of %lu leaves free, floor %lu) - sweeping every "
 +				"thread's cache; raise -m/-M if this repeats\n",
++				hb->name, hb->buddy_free_leaves,
++				hb->npages * hg_leaves_per_page(hb), hb->reserve_floor);
++		} else {
++			LM_DBG("%s: free space fell below the reserve floor "
++				"(%lu of %lu leaves free, floor %lu) - sweeping every "
++				"thread's cache; the arena can still grow\n",
 +				hb->name, hb->buddy_free_leaves,
 +				hb->npages * hg_leaves_per_page(hb), hb->reserve_floor);
 +		}
 +	} else if (hb->below_floor &&
 +	           hb->buddy_free_leaves > hb->reserve_floor * 2) {
 +		hb->below_floor = 0;
-+		LM_NOTICE("%s: free space recovered above the reserve floor "
-+			"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
++		if (hb->floor_warned)
++			LM_NOTICE("%s: free space recovered above the reserve floor "
++				"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
++		else
++			LM_DBG("%s: free space recovered above the reserve floor "
++				"(%lu leaves free)\n", hb->name, hb->buddy_free_leaves);
++		hb->floor_warned = 0;
 +		/* recovery past the same 2x-floor threshold also ends a
 +		 * grow-blocked episode: the arena could not grow, but the
 +		 * demand that needed it to has gone away. One hysteresis
@@ -8926,10 +8959,10 @@ index 0000000000..36042bda7e
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..52895dca84
+index 0000000000..f343963dda
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1580 @@
+@@ -0,0 +1,1581 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -9841,6 +9874,7 @@ index 0000000000..52895dca84
 +	 */
 +	unsigned long       reserve_floor;
 +	unsigned int        below_floor;      /* hysteresis: already reported */
++	unsigned int        floor_warned;     /* this crossing was a WARN */
 +	unsigned long       floor_crossings;
 +
 +	unsigned char size2class[(HG_CELL_MAX / HG_ROUNDTO) + 1];
@@ -11372,7 +11406,7 @@ index deaecc106a..b08bc59663 100644
  #if defined F_MALLOC || defined Q_MALLOC
  		|| mem_lock
 diff --git a/mi/mi_core.c b/mi/mi_core.c
-index ce49333672..611c724118 100644
+index ce49333672..feb6f44fb4 100644
 --- a/mi/mi_core.c
 +++ b/mi/mi_core.c
 @@ -44,6 +44,11 @@
@@ -11395,7 +11429,7 @@ index ce49333672..611c724118 100644
  	}
  
  	return resp;
-@@ -982,6 +988,716 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
+@@ -982,6 +988,717 @@ static mi_response_t *w_reload_routes(const mi_params_t *params,
  
  
  
@@ -11732,8 +11766,9 @@ index ce49333672..611c724118 100644
 +		return -1;
 +	/*
 +	 * Reserve-floor state.  Without these the floor is unobservable in
-+	 * production: crossing it only emits one LM_WARN and bumps a sweep
-+	 * generation that is indistinguishable from the periodic sweep.
++	 * production: crossing it only logs (a WARN only when the arena
++	 * cannot grow out of it) and bumps a sweep generation that is
++	 * indistinguishable from the periodic sweep.
 +	 */
 +	if (add_mi_number(o, MI_SSTR("reserve_floor"), hb->reserve_floor) < 0)
 +		return -1;
@@ -12112,7 +12147,7 @@ index ce49333672..611c724118 100644
  static const mi_export_t mi_core_cmds[] = {
  	{ "pi_list", "lists the provisioning framework", 0, 0, {
  		{w_mi_pi_list, {0}},
-@@ -1005,6 +1721,20 @@ static const mi_export_t mi_core_cmds[] = {
+@@ -1005,6 +1722,20 @@ static const mi_export_t mi_core_cmds[] = {
  		{mi_pwd, {0}},
  		{EMPTY_MI_RECIPE}}, {0}
  	},
