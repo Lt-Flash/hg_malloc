@@ -1,4 +1,4 @@
-From 66f9acedd43aca789e7271c0224dadf05ca67424 Mon Sep 17 00:00:00 2001
+From bef33225adb9828d01710bdd5f362379c0867652 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -40,8 +40,9 @@ existing configurations.
  - core:hg_stats (MI) per arena: tier, committed/reserved, per-class carve
    and reuse, grows/shrinks, lock hold/wait histograms per reason and the
    corruption counters; core:hg_advise (MI) recommends -m/-M from the peaks
-   reached; an hgmem: statistics group; E_CORE_HG_LOCK_STALL for a hold
-   above hg_lock_stall_us.
+   reached; an hgmem: statistics group, including hg_pkg_grow_refused and
+   hg_pkg_grow_blocked summed over every process's private arena;
+   E_CORE_HG_LOCK_STALL for a hold above hg_lock_stall_us.
  - A per-block free map at the pool boundary catches a double free when
    it reaches the shared pool and stops a free-list walk at a scribbled
    link; both are counted and logged and the process keeps running.
@@ -70,19 +71,19 @@ procedures: mem/README.hg_malloc.md.
  globals.h                   |   25 +
  help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc.md     |  341 +++++
+ mem/README.hg_malloc.md     |  343 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
- mem/hg_arena.c              | 2346 +++++++++++++++++++++++++++++++++++
+ mem/hg_arena.c              | 2367 +++++++++++++++++++++++++++++++++++
  mem/hg_arena.h              |  136 ++
- mem/hg_buddy.c              | 1649 ++++++++++++++++++++++++
+ mem/hg_buddy.c              | 1651 ++++++++++++++++++++++++
  mem/hg_buddy.h              |  249 ++++
  mem/hg_large.c              |  426 +++++++
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 2073 +++++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1529 +++++++++++++++++++++++
+ mem/hg_malloc.c             | 2133 +++++++++++++++++++++++++++++++
+ mem/hg_malloc.h             | 1541 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -93,13 +94,13 @@ procedures: mem/README.hg_malloc.md.
  mi/mi_core.c                |  730 +++++++++++
  modules/hgstress/Makefile   |    9 +
  modules/hgstress/hgstress.c |  576 +++++++++
- pt.c                        |  128 ++
+ pt.c                        |  133 ++
  pt_scaling.c                |   22 +-
  pt_scaling.h                |    5 +
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11950 insertions(+), 38 deletions(-)
+ 41 files changed, 12052 insertions(+), 38 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1056,10 +1057,10 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..eace5c96dd
+index 0000000000..cd6c61ee11
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,343 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
@@ -1160,7 +1161,7 @@ index 0000000000..eace5c96dd
 +## 4. Private (pkg) arenas
 +
 +- Each process creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every process individually. The pre-fork parent arena never uses hugetlb, so no child can fault on the pool through a copy-on-write page, and never gets the profile; it keeps the `-M` cap and can still grow on exhaustion.
-+- A process grows and shrinks only its own arena; its policy runs in its own 30 s sweep, whatever `hg_scaling_cycle` is set to.
++- A process grows and shrinks only its own arena; its policy, and its GROW-BLOCKED latch, run in its own 30 s sweep, whatever `hg_scaling_cycle` is set to. Each process publishes its refusals and GROW-BLOCKED state at that sweep, summed as `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 +- Host cost multiplies with the process count - and on tier 1, so does the pool reservation, since each process's arena reserves its own cap.
 +
 +## 5. Module arenas
@@ -1181,7 +1182,7 @@ index 0000000000..eace5c96dd
 +| `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats, other), stalls, the worst hold and its reason, commit and release times |
 +| `corruption` | double frees, foreign pointers, bad classes, counted per kind |
 +
-+**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
++**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), plus `hg_pkg_grow_refused` and `hg_pkg_grow_blocked` summed over every process's private arena, suitable for Prometheus.
 +
 +**Events:** `E_CORE_SHM_GROW_BLOCKED` (section 3.3) and `E_CORE_HG_LOCK_STALL`, raised for a shared-arena lock hold at or above `hg_lock_stall_us` (default 1000 us), with `reason`, `hold_us`, `process` and `stalls`.
 +
@@ -1365,11 +1366,13 @@ index 0000000000..eace5c96dd
 +
 +`hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `hg_advise` covers the worst process.
 +
-+The `hgmem:` statistics group holds the shared arena's figures. The ones worth alerting on:
++The `hgmem:` statistics group holds the shared arena's figures, plus two that sum every process's private arena (each process publishes its own at its 30 s cache sweep). The ones worth alerting on:
 +
 +| statistic | alert when |
 +|---|---|
 +| `hg_shm_grow_blocked` | 1 - growth refused for a sustained period |
++| `hg_pkg_grow_blocked` | above 0 - that many processes' private arenas cannot grow (no event for these: alert on this) |
++| `hg_pkg_grow_refused` | rising - private-arena grows refused, all processes together |
 +| `hg_shm_corruption` | above 0 - memory was corrupted and the allocator caught it |
 +| `hg_shm_repin_failed` | above 0 - memory taken back from the host could not be pinned again |
 +| `hg_shm_lock_stalls` | rising steadily |
@@ -1390,11 +1393,11 @@ index 0000000000..eace5c96dd
 +
 +The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 +
-+- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED).
++- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
 +- **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 +- **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 +- **Every arena:** an INIT the host cannot hold is refused when the arena is created.
-+- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process.
++- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 +
 +```
 +INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 192 MB from the hugetlb pool, 224 MB (288 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor
@@ -1512,10 +1515,10 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..953ab96708
+index 0000000000..f425f0bd21
 --- /dev/null
 +++ b/mem/hg_arena.c
-@@ -0,0 +1,2346 @@
+@@ -0,0 +1,2367 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -2500,8 +2503,14 @@ index 0000000000..953ab96708
 +		 * by the sweep timer alone, or 30 workers would each tick
 +		 * the one shared window counter. */
 +		if (!hb->shared) {
++			/* this sweep is the private arena's 30 s interval: it
++			 * latches (or disarms) GROW-BLOCKED here, as the sweep
++			 * timer does for the shared one */
++			hg_grow_blocked_tick(hb);
 +			hg_grow_tick(hb);
 +			hg_shrink_tick(hb);
++			if (!strcmp(hb->name, "pkg"))
++				hg_pkg_publish(hb);
 +		}
 +		hg_lock_leave(hb);
 +		if (n)
@@ -3644,6 +3653,7 @@ index 0000000000..953ab96708
 +
 +#include "../statistics.h"
 +#include "shm_mem.h"   /* mem_allocator_shm */
++#include "mem.h"       /* mem_allocator_pkg */
 +
 +/* --- lock-stall bookkeeping (called after the release) ----------------- */
 +const char * const hg_lk_reason_str[HG_LK_REASONS] = {
@@ -3843,6 +3853,20 @@ index 0000000000..953ab96708
 +{
 +	int i;
 +
++#ifdef PKG_MALLOC
++	if ((mem_allocator_pkg == MM_HG_MALLOC ||
++	     mem_allocator_pkg == MM_HG_MALLOC_DBG) &&
++	    (register_stat2("hgmem", "hg_pkg_grow_refused",
++	        (stat_var **)hg_pkg_pub_stat, STAT_NO_RESET|STAT_IS_FUNC,
++	        (void *)0L, 0) != 0 ||
++	     register_stat2("hgmem", "hg_pkg_grow_blocked",
++	        (stat_var **)hg_pkg_pub_stat, STAT_NO_RESET|STAT_IS_FUNC,
++	        (void *)1L, 0) != 0)) {
++		LM_ERR("failed to add the pkg growth statistics\n");
++		return -1;
++	}
++#endif
++
 +	if (mem_allocator_shm != MM_HG_MALLOC &&
 +	        mem_allocator_shm != MM_HG_MALLOC_DBG)
 +		return 0;       /* a different allocator is in use - nothing to say */
@@ -4006,10 +4030,10 @@ index 0000000000..f67128179d
 +#endif /* hg_arena_h */
 diff --git a/mem/hg_buddy.c b/mem/hg_buddy.c
 new file mode 100644
-index 0000000000..1552f2a14f
+index 0000000000..d5bc0c1bcb
 --- /dev/null
 +++ b/mem/hg_buddy.c
-@@ -0,0 +1,1649 @@
+@@ -0,0 +1,1651 @@
 +/*
 + * buddy allocator over the HG_MALLOC huge-page grid
 + *
@@ -4469,8 +4493,9 @@ index 0000000000..1552f2a14f
 +		hb->grow_event_due = 1;
 +		LM_WARN("%s: GROW-BLOCKED latched - the arena cannot grow and "
 +			"a GC pass did not change that (%lu refusals so far). "
-+			"Alert on hg_shm_grow_blocked; details precede this "
-+			"line.\n", hb->name, hb->grow_refused);
++			"Alert on %s; details precede this line.\n", hb->name,
++			hb->grow_refused, hb->shared ? "hg_shm_grow_blocked" :
++			"hg_pkg_grow_blocked");
 +	}
 +	return -1;
 +}
@@ -4503,8 +4528,9 @@ index 0000000000..1552f2a14f
 +		hb->grow_event_due = 1;
 +		LM_WARN("%s: GROW-BLOCKED latched - the arena cannot grow and "
 +			"a full sweep interval did not change that (%lu refusals "
-+			"so far). Alert on hg_shm_grow_blocked; details precede "
-+			"this line.\n", hb->name, hb->grow_refused);
++			"so far). Alert on %s; details precede this line.\n",
++			hb->name, hb->grow_refused,
++			hb->shared ? "hg_shm_grow_blocked" : "hg_pkg_grow_blocked");
 +	} else {
 +		/* armed but quiet for a whole interval: the spike passed */
 +		hb->grow_blocked_mark = 0;
@@ -6720,10 +6746,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..99e2dfc62b
+index 0000000000..fd9e51c816
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,2073 @@
+@@ -0,0 +1,2133 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7413,6 +7439,66 @@ index 0000000000..99e2dfc62b
 +		HG_SZ_VAL(need), HG_SZ_UNIT(need),
 +		room == ~0UL ? 0 : room >> 20, hg_ram_floor(), pool >> 20);
 +	return 0;
++}
++
++/*
++ * Private arenas are per process, so their growth refusals are invisible
++ * to statistics read in another process. Each process publishes its own
++ * pkg arena's refusal count and GROW-BLOCKED state into its slot of this
++ * shared array at every cache sweep; the hgmem: statistics sum them.
++ */
++struct hg_pkg_pub {
++	unsigned long grow_refused;
++	unsigned int grow_blocked;
++};
++static struct hg_pkg_pub *hg_pkg_pub;
++static unsigned int hg_pkg_pub_n;
++
++int hg_pkg_pub_init(unsigned int nproc)
++{
++#ifdef PKG_MALLOC
++	if (mem_allocator_pkg != MM_HG_MALLOC &&
++	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
++		return 0;
++	hg_pkg_pub = shm_malloc(nproc * sizeof *hg_pkg_pub);
++	if (!hg_pkg_pub) {
++		LM_ERR("no shm for the pkg growth statistics\n");
++		return -1;
++	}
++	memset(hg_pkg_pub, 0, nproc * sizeof *hg_pkg_pub);
++	hg_pkg_pub_n = nproc;
++#endif
++	return 0;
++}
++
++void hg_pkg_publish(struct hg_block *hb)
++{
++	if (!hg_pkg_pub || process_no < 0 ||
++	    (unsigned int)process_no >= hg_pkg_pub_n)
++		return;
++	hg_pkg_pub[process_no].grow_refused = hb->grow_refused;
++	hg_pkg_pub[process_no].grow_blocked = hb->grow_blocked;
++}
++
++void hg_pkg_pub_reset(int proc)
++{
++	if (hg_pkg_pub && proc >= 0 && (unsigned int)proc < hg_pkg_pub_n)
++		memset(&hg_pkg_pub[proc], 0, sizeof *hg_pkg_pub);
++}
++
++/* @ctx: 0 = refused grows summed over all processes, 1 = processes whose
++ * pkg arena is GROW-BLOCKED now */
++unsigned long hg_pkg_pub_stat(void *ctx)
++{
++	unsigned long sum = 0;
++	unsigned int i;
++
++	if (!hg_pkg_pub)
++		return 0;
++	for (i = 0; i < hg_pkg_pub_n; i++)
++		sum += ctx ? (hg_pkg_pub[i].grow_blocked ? 1 : 0) :
++		             hg_pkg_pub[i].grow_refused;
++	return sum;
 +}
 +
 +/*
@@ -8799,10 +8885,10 @@ index 0000000000..99e2dfc62b
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..41de3d5a41
+index 0000000000..a17efdb127
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1529 @@
+@@ -0,0 +1,1541 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -9841,6 +9927,18 @@ index 0000000000..41de3d5a41
 + */
 +int hg_capacity_check(unsigned int start_procs, unsigned int max_procs);
 +int hg_fork_fits(void);
++
++/*
++ * Private-arena growth refusals, published per process into a shared
++ * array (hg_pkg_pub_init(), pre-fork) at each cache sweep
++ * (hg_pkg_publish()) and read back as hgmem:hg_pkg_grow_refused (sum) and
++ * hgmem:hg_pkg_grow_blocked (processes blocked now) via hg_pkg_pub_stat().
++ * hg_pkg_pub_reset() clears a slot when its process is gone.
++ */
++int hg_pkg_pub_init(unsigned int nproc);
++void hg_pkg_publish(struct hg_block *hb);
++void hg_pkg_pub_reset(int proc);
++unsigned long hg_pkg_pub_stat(void *ctx);
 +
 +/*
 + * Release the backing of [hbase+off, +len) - the shrink primitive, chosen
@@ -12553,7 +12651,7 @@ index 0000000000..4309590b07
 +	NULL         /* reload confirm */
 +};
 diff --git a/pt.c b/pt.c
-index d6f9c828c3..0d4772c51f 100644
+index d6f9c828c3..27b5b17b6c 100644
 --- a/pt.c
 +++ b/pt.c
 @@ -33,6 +33,7 @@
@@ -12564,7 +12662,7 @@ index d6f9c828c3..0d4772c51f 100644
  #include "bin_interface.h"
  #include "core_stats.h"
  
-@@ -144,6 +145,24 @@ int init_multi_proc_support(void)
+@@ -144,6 +145,26 @@ int init_multi_proc_support(void)
  	}
  	#endif
  
@@ -12573,6 +12671,8 @@ index d6f9c828c3..0d4772c51f 100644
 +	 * the host cannot hold before anything forks */
 +	if (hg_capacity_check(count_init_child_processes(),
 +	        counted_max_processes) != 0)
++		return -1;
++	if (hg_pkg_pub_init(counted_max_processes) != 0)
 +		return -1;
 +#endif
 +
@@ -12589,7 +12689,17 @@ index d6f9c828c3..0d4772c51f 100644
  	/* set the pid for the starter process */
  	set_proc_attrs("starter");
  
-@@ -266,6 +285,29 @@ static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
+@@ -225,6 +246,9 @@ void reset_process_slot( int p_id )
+ 	 * with the inter-process communication fds */
+ 	pt[p_id].pid = -1;
+ 	pt[p_id].type = TYPE_NONE;
++#ifdef HG_MALLOC
++	hg_pkg_pub_reset(p_id);
++#endif
+ 	pt[p_id].pg_filter = NULL;
+ 	pt[p_id].desc[0] = 0;
+ 	pt[p_id].flags = 0;
+@@ -266,6 +290,29 @@ static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
  
  	/* free the script if not needed */
  	if (!(ifpp->flags & OSS_PROC_NEEDS_SCRIPT) && sroutes) {
@@ -12619,7 +12729,7 @@ index d6f9c828c3..0d4772c51f 100644
  		free_route_lists(sroutes);
  		sroutes = NULL;
  	}
-@@ -295,6 +337,13 @@ int internal_fork(const struct internal_fork_params *ifpp)
+@@ -295,6 +342,13 @@ int internal_fork(const struct internal_fork_params *ifpp)
  		return -1;
  	}
  
@@ -12633,7 +12743,7 @@ index d6f9c828c3..0d4772c51f 100644
  	seed = rand();
  
  	LM_DBG("forking new process \"%s\" on slot %d\n", ifpp->proc_desc, new_idx);
-@@ -331,6 +380,23 @@ int internal_fork(const struct internal_fork_params *ifpp)
+@@ -331,6 +385,23 @@ int internal_fork(const struct internal_fork_params *ifpp)
  		const struct internal_fork_handler *cfhp;
  		/* child process */
  		is_main = 0; /* a child is not main process */
@@ -12657,7 +12767,7 @@ index d6f9c828c3..0d4772c51f 100644
  		/* set uid */
  		process_no = new_idx;
  		/* set attributes, pid etc */
-@@ -364,6 +430,65 @@ int internal_fork(const struct internal_fork_params *ifpp)
+@@ -364,6 +435,65 @@ int internal_fork(const struct internal_fork_params *ifpp)
  				child_startup_failed();
  			}
  		}
@@ -12723,7 +12833,7 @@ index d6f9c828c3..0d4772c51f 100644
  		atomic_store(&pt[process_no].startup_result, CHLD_OK);
  		return 0;
  	}else{
-@@ -449,6 +574,9 @@ int count_child_processes(void)
+@@ -449,6 +579,9 @@ int count_child_processes(void)
  	proc_no += timer_count_processes( &extra );
  	proc_extra_no += extra;
  

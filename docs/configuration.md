@@ -142,11 +142,13 @@ opensips-cli -x mi statistics:get hgmem:
 
 `hg_stats` answers for the process that receives the MI command, so its `pkg` section is that process's private arena; `hg_advise` covers the worst process.
 
-The `hgmem:` statistics group holds the shared arena's figures. The ones worth alerting on:
+The `hgmem:` statistics group holds the shared arena's figures, plus two that sum every process's private arena (each process publishes its own at its 30 s cache sweep). The ones worth alerting on:
 
 | statistic | alert when |
 |---|---|
 | `hg_shm_grow_blocked` | 1 - growth refused for a sustained period |
+| `hg_pkg_grow_blocked` | above 0 - that many processes' private arenas cannot grow (no event for these: alert on this) |
+| `hg_pkg_grow_refused` | rising - private-arena grows refused, all processes together |
 | `hg_shm_corruption` | above 0 - memory was corrupted and the allocator caught it |
 | `hg_shm_repin_failed` | above 0 - memory taken back from the host could not be pinned again |
 | `hg_shm_lock_stalls` | rising steadily |
@@ -167,11 +169,11 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 
 The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 
-- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED).
+- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
 - **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 - **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 - **Every arena:** an INIT the host cannot hold is refused when the arena is created.
-- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process.
+- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 
 ```
 INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 192 MB from the hugetlb pool, 224 MB (288 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor

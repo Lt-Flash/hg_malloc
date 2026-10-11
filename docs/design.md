@@ -98,7 +98,7 @@ Refusal details are logged once per episode; `grow_refused` carries the count.
 ## 4. Private (pkg) arenas
 
 - Each process creates its own private arena at fork, after the configuration is parsed, so `-M INIT:CAP` and `pkg_auto_scaling_profile` apply to every process individually. The pre-fork parent arena never uses hugetlb, so no child can fault on the pool through a copy-on-write page, and never gets the profile; it keeps the `-M` cap and can still grow on exhaustion.
-- A process grows and shrinks only its own arena; its policy runs in its own 30 s sweep, whatever `hg_scaling_cycle` is set to.
+- A process grows and shrinks only its own arena; its policy, and its GROW-BLOCKED latch, run in its own 30 s sweep, whatever `hg_scaling_cycle` is set to. Each process publishes its refusals and GROW-BLOCKED state at that sweep, summed as `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
 - Host cost multiplies with the process count - and on tier 1, so does the pool reservation, since each process's arena reserves its own cap.
 
 ## 5. Module arenas
@@ -119,7 +119,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | `lock` | hold and wait histograms per reason (refill, return, flush, large, policy, stats, other), stalls, the worst hold and its reason, commit and release times |
 | `corruption` | double frees, foreign pointers, bad classes, counted per kind |
 
-**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), suitable for Prometheus.
+**Statistics:** `hg_shm_*` counters in the `hgmem:` group (growth, refusals, the GROW-BLOCKED gauge), plus `hg_pkg_grow_refused` and `hg_pkg_grow_blocked` summed over every process's private arena, suitable for Prometheus.
 
 **Events:** `E_CORE_SHM_GROW_BLOCKED` (section 3.3) and `E_CORE_HG_LOCK_STALL`, raised for a shared-arena lock hold at or above `hg_lock_stall_us` (default 1000 us), with `reason`, `hold_us`, `process` and `stalls`.
 
