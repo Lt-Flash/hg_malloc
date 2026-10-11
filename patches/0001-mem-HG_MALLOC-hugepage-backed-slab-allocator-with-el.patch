@@ -1,4 +1,4 @@
-From a2b29f1df8622c4d9e315ac7be33e1a57900871f Mon Sep 17 00:00:00 2001
+From a39bc476c8cdb3b518a6ded90188a0df040e49b8 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 10:42:53 +1100
 Subject: [PATCH 1/2] mem: HG_MALLOC - hugepage-backed slab allocator with
@@ -65,15 +65,15 @@ procedures: mem/README.hg_malloc_v3.md.
  mem/hg_large.h             |  102 ++
  mem/hg_maint.c             |  213 ++++
  mem/hg_maint.h             |   39 +
- mem/hg_malloc.c            | 1819 ++++++++++++++++++++++++++++
- mem/hg_malloc.h            | 1509 +++++++++++++++++++++++
+ mem/hg_malloc.c            | 1828 ++++++++++++++++++++++++++++
+ mem/hg_malloc.h            | 1516 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h        |  203 ++++
  mem/hg_version.h           |   39 +
  mem/mem.c                  |   64 +-
  mem/mem.h                  |   12 +
  mem/mem_arena.h            |  125 ++
  mem/shm_mem.c              |  160 ++-
- mem/shm_mem.h              |   45 +-
+ mem/shm_mem.h              |   51 +-
  mi/mi_core.c               |  726 +++++++++++
  pt.c                       |  113 ++
  pt_scaling.c               |   22 +-
@@ -81,7 +81,7 @@ procedures: mem/README.hg_malloc_v3.md.
  socket_info.c              |   16 +
  statistics.c               |    9 +
  version.h                  |    9 +-
- 38 files changed, 10956 insertions(+), 35 deletions(-)
+ 38 files changed, 10977 insertions(+), 36 deletions(-)
  create mode 100644 mem/README.hg_malloc_v3.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -6559,10 +6559,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..1734eed312
+index 0000000000..0834bd360a
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,1819 @@
+@@ -0,0 +1,1828 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7658,8 +7658,12 @@ index 0000000000..1734eed312
 +	struct scaling_profile *p;
 +	int hg_shm = (mem_allocator_shm == MM_HG_MALLOC ||
 +	              mem_allocator_shm == MM_HG_MALLOC_DBG);
++#ifdef PKG_MALLOC
 +	int hg_pkg = (mem_allocator_pkg == MM_HG_MALLOC ||
 +	              mem_allocator_pkg == MM_HG_MALLOC_DBG);
++#else
++	int hg_pkg = 0;     /* pkg memory is the system malloc */
++#endif
 +
 +	if (hg_shm_profile_name) {
 +		if (!hg_shm) {
@@ -7710,9 +7714,14 @@ index 0000000000..1734eed312
 +
 +	if (hg_pkg_profile_name) {
 +		if (!hg_pkg) {
++#ifdef PKG_MALLOC
 +			LM_WARN("pkg_auto_scaling_profile ignored: the pkg "
 +				"allocator is %s, not " HG_MALLOC_NAME "\n",
 +				mm_str(mem_allocator_pkg));
++#else
++			LM_WARN("pkg_auto_scaling_profile ignored: pkg memory is "
++				"the system malloc, not " HG_MALLOC_NAME "\n");
++#endif
 +		} else {
 +			p = get_scaling_profile(hg_pkg_profile_name);
 +			if (!p) {
@@ -8384,10 +8393,10 @@ index 0000000000..1734eed312
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..e37e40505f
+index 0000000000..7996730d2d
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1509 @@
+@@ -0,0 +1,1516 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -8529,19 +8538,26 @@ index 0000000000..e37e40505f
 +/* offset of the statistic_index field, valid only when SHM_EXTRA_STATS */
 +#define HG_CELL_STATS_OFF (HG_ROUNDTO + HG_CELL_HDR_DBG)
 +
++/* C++ modules include this header too */
++#ifdef __cplusplus
++#define HG_STATIC_ASSERT static_assert
++#else
++#define HG_STATIC_ASSERT _Static_assert
++#endif
++
 +/* the pins: the documented offsets, and the raw size the arithmetic gave */
-+_Static_assert(HG_CELL_HDR_RAW == HG_ROUNDTO + HG_CELL_HDR_DBG + HG_CELL_HDR_STATS,
++HG_STATIC_ASSERT(HG_CELL_HDR_RAW == HG_ROUNDTO + HG_CELL_HDR_DBG + HG_CELL_HDR_STATS,
 +	"struct hg_cell_hdr is not the documented header layout");
-+_Static_assert(offsetof(struct hg_cell_hdr, cls) == 0,
++HG_STATIC_ASSERT(offsetof(struct hg_cell_hdr, cls) == 0,
 +	"the class byte must be the first byte of the header");
 +#ifdef DBG_MALLOC
-+_Static_assert(offsetof(struct hg_cell_hdr, file) == HG_ROUNDTO &&
++HG_STATIC_ASSERT(offsetof(struct hg_cell_hdr, file) == HG_ROUNDTO &&
 +	offsetof(struct hg_cell_hdr, func) == HG_ROUNDTO * 2 &&
 +	offsetof(struct hg_cell_hdr, line) == HG_ROUNDTO * 3,
 +	"the DBG_MALLOC fields moved");
 +#endif
 +#ifdef SHM_EXTRA_STATS
-+_Static_assert(offsetof(struct hg_cell_hdr, stat_idx) == HG_CELL_STATS_OFF,
++HG_STATIC_ASSERT(offsetof(struct hg_cell_hdr, stat_idx) == HG_CELL_STATS_OFF,
 +	"the statistic_index field moved");
 +#endif
 +
@@ -8692,7 +8708,7 @@ index 0000000000..e37e40505f
 +
 +/* two cache lines on LP64 with the map in the spare bytes; smaller on ILP32,
 + * where the pointers shrink - never more */
-+_Static_assert(sizeof(struct hg_chunk) <= 128,
++HG_STATIC_ASSERT(sizeof(struct hg_chunk) <= 128,
 +	"struct hg_chunk must not exceed two cache lines");
 +
 +/*
@@ -10681,7 +10697,7 @@ index 9d6d9fd948..b8063460bd 100644
  	int j;
  
 diff --git a/mem/shm_mem.h b/mem/shm_mem.h
-index deaecc106a..b08bc59663 100644
+index deaecc106a..bf1f4625e6 100644
 --- a/mem/shm_mem.h
 +++ b/mem/shm_mem.h
 @@ -82,6 +82,14 @@
@@ -10732,7 +10748,7 @@ index deaecc106a..b08bc59663 100644
  #else
  #define SHM_MALLOC             gen_shm_malloc
  #define SHM_MALLOC_UNSAFE      gen_shm_malloc_unsafe
-@@ -286,7 +311,7 @@ inline static void shm_threshold_check(void)
+@@ -286,11 +311,11 @@ inline static void shm_threshold_check(void)
   #define shm_threshold_check()
  #endif
  
@@ -10741,7 +10757,23 @@ index deaecc106a..b08bc59663 100644
  	#ifdef INLINE_ALLOC
  	#define shm_lock()
  	#define shm_unlock()
-@@ -840,6 +865,22 @@ inline static void shm_info(struct mem_info* mi)
+-	#else
++	#elif defined F_MALLOC || defined Q_MALLOC
+ 	extern int shm_use_global_lock;
+ 	#define shm_lock() \
+ 		do { \
+@@ -302,6 +327,10 @@ inline static void shm_threshold_check(void)
+ 			if (shm_use_global_lock) \
+ 				lock_release(mem_lock); \
+ 		} while (0)
++	#else
++	/* no allocator with a global lock is built in */
++	#define shm_lock()
++	#define shm_unlock()
+ 	#endif
+ 	extern unsigned long long *shm_hash_usage;
+ #else
+@@ -840,6 +869,22 @@ inline static void shm_info(struct mem_info* mi)
  
  inline static void shm_force_unlock(void)
  {

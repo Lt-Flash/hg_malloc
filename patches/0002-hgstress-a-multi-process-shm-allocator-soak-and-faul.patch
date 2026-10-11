@@ -1,4 +1,4 @@
-From 912aab5a95aca99047b6458de743a16da9adfb8c Mon Sep 17 00:00:00 2001
+From 637fb09c6abefaa01515ef9244c4d000ad3f22b7 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 10:42:53 +1100
 Subject: [PATCH 2/2] hgstress: a multi-process shm allocator soak and
