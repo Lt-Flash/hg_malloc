@@ -1,4 +1,4 @@
-From 58ded01b48fc20672693e12a1c723481d08b033f Mon Sep 17 00:00:00 2001
+From 2223704c860dcee35da820e556e2f500ff49db37 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -53,8 +53,8 @@ procedures: mem/README.hg_malloc_v3.md.
  Makefile.defs               |    3 +
  cfg.lex                     |   33 +
  cfg.y                       |  161 ++-
- core_stats.c                |  301 +++++
- core_stats.h                |   19 +
+ core_stats.c                |  306 +++++
+ core_stats.h                |   21 +
  evi/evi_core.c              |    7 +
  evi/evi_core.h              |    8 +
  globals.c                   |   23 +
@@ -90,7 +90,7 @@ procedures: mem/README.hg_malloc_v3.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11565 insertions(+), 36 deletions(-)
+ 41 files changed, 11572 insertions(+), 36 deletions(-)
  create mode 100644 mem/README.hg_malloc_v3.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -423,7 +423,7 @@ index 5647ac79ea..172955ee9e 100644
  				auto_scaling_cycle=$3; }
  		| AUTO_SCALING_CYCLE EQUAL error {
 diff --git a/core_stats.c b/core_stats.c
-index 739a520700..960060518c 100644
+index 739a520700..e6196745f8 100644
 --- a/core_stats.c
 +++ b/core_stats.c
 @@ -186,6 +186,307 @@ static unsigned long get_pkg_fragments( void*proc_id)
@@ -734,19 +734,24 @@ index 739a520700..960060518c 100644
  
  int init_pkg_stats(int procs_no)
  {
+@@ -328,3 +629,8 @@ int init_pkg_stats(int procs_no)
+ #endif /* PKG */
+ 
+ #endif /* STATISTICS */
++
++#if !defined(STATISTICS) || !defined(PKG_MALLOC)
++/* the sweep runs over the pkg statistics: nothing to register without them */
++int hg_register_cache_sweep(void) { return 0; }
++#endif
 diff --git a/core_stats.h b/core_stats.h
-index acccd57fd9..d2dc2ee09b 100644
+index acccd57fd9..e1f046a3fa 100644
 --- a/core_stats.h
 +++ b/core_stats.h
-@@ -76,6 +76,25 @@ extern stat_var* slow_msgs;
+@@ -76,8 +76,29 @@ extern stat_var* slow_msgs;
  
  #ifdef PKG_MALLOC
  int init_pkg_stats(int no_procs);
 +
-+/* Registers the HG_MALLOC idle-cache sweep. No-op unless HG_MALLOC is the
-+ * live allocator. Must be called PRE-FORK: register_timer() only accepts
-+ * registrations before the timer processes are created. */
-+int hg_register_cache_sweep(void);
 +
 +/*
 + * Highest pkg high-water reached by ANY process, the sum across all of them,
@@ -764,6 +769,14 @@ index acccd57fd9..d2dc2ee09b 100644
  #endif
  
  #endif /*STATISTICS*/
+ 
++/* Registers the HG_MALLOC idle-cache sweep. No-op unless HG_MALLOC is the
++ * live allocator, and a stub without pkg statistics. Must be called
++ * PRE-FORK: register_timer() only accepts registrations before the timer
++ * processes are created. */
++int hg_register_cache_sweep(void);
++
+ #endif /*_CORE_STATS_H_*/
 diff --git a/evi/evi_core.c b/evi/evi_core.c
 index 909de2dbbc..2b4dab8a59 100644
 --- a/evi/evi_core.c
