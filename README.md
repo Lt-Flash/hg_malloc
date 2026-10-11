@@ -4,14 +4,14 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 
 ## Why
 
-- **Less CPU per call:** 17-21% less than F_MALLOC for the whole server at 20k-60k calls per second.
-- **No drops under load:** 0 UDP drops at 60k cps, where F_MALLOC drops over 130,000; the workers keep the socket drained.
-- **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 11-19 s for F_MALLOC.
+- **Less CPU per call:** 10-30% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second.
+- **No drops under load:** 0 UDP drops at 60k cps, where every other allocator drops 160,000 or more; the workers keep the socket drained.
+- **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 11-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
 - **Safe and observable:** double frees and corrupted free lists are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; tested on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
-Measured on vanilla OpenSIPS, F_MALLOC and HG_MALLOC from the same binary - see [benchmarks](docs/benchmarks.md). In production on 11 SIP nodes (SBCs and registrars) since October 2026.
+Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchmarks](docs/benchmarks.md). In production on 11 SIP nodes (SBCs and registrars) since October 2026.
 
 ## How it works
 
