@@ -63,6 +63,18 @@ The same point once more with the host's CPU sampled by `mpstat` on the server o
 
 The others drop with 10 or more of the 16 cores idle, so the workers are not short of CPU: they fall behind in bursts and the 8 MB socket buffer overflows. Drop counts vary between runs - F_MALLOC dropped 1,119,613 and 541,454 in the two runs at this point, HP_MALLOC 363,419 and 165,880 - while the order of the arms and HG_MALLOC's zero did not change.
 
+Straight after it, the same point with 32 MB socket buffers: `maxbuffer` and `rmem`/`wmem` default and max on the server raised from 8 MB to 32 MB, the clients unchanged:
+
+| 60,000, `-m 4096`, 32 MB buffers | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+|---|---|---|---|---|
+| OpenSIPS CPU, cores | 5.71 | 5.29 | 5.33 | **4.44** |
+| host idle | 62% (9.8 cores) | 65% (10.4) | 65% (10.5) | **71% (11.4)** |
+| UDP drops (8 MB run) | 459,068 (541,454) | 0 (2,998) | 230,920 (165,880) | **0 (0)** |
+| INVITE p99 (probe) | 12.1 ms | 7.6 ms | 8.4 ms | **3.1 ms** |
+| slowest probe INVITE | 241 ms | 554 ms | 54 ms | **11 ms** |
+
+Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the difference is within their run-to-run spread - so their workers stall for longer than 32 MB of queue covers. F_PARALLEL_MALLOC, which dropped only 2,998 with 8 MB, dropped none; one of its probe INVITEs still took 554 ms. HG_MALLOC dropped none on the server either way; with 32 MB, one client host retransmitted 3,342 times and two probe INVITEs timed out while the server's receive and send error counters stayed at zero.
+
 ## Memory under load
 
 Peak shared memory in the INVITE runs above, with the UDP drops of the same run:
