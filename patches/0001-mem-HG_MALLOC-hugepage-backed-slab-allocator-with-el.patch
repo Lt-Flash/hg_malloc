@@ -1,4 +1,4 @@
-From bef33225adb9828d01710bdd5f362379c0867652 Mon Sep 17 00:00:00 2001
+From dd92ab9e5fb7ef361e18253c3a1f38201a44e5a3 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -63,7 +63,7 @@ procedures: mem/README.hg_malloc.md.
  Makefile.defs               |    3 +
  cfg.lex                     |   33 +
  cfg.y                       |  161 ++-
- core_stats.c                |  305 +++++
+ core_stats.c                |  306 +++++
  core_stats.h                |   21 +
  evi/evi_core.c              |    7 +
  evi/evi_core.h              |    8 +
@@ -71,19 +71,19 @@ procedures: mem/README.hg_malloc.md.
  globals.h                   |   25 +
  help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc.md     |  343 +++++
+ mem/README.hg_malloc.md     |  344 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
- mem/hg_arena.c              | 2367 +++++++++++++++++++++++++++++++++++
+ mem/hg_arena.c              | 2373 +++++++++++++++++++++++++++++++++++
  mem/hg_arena.h              |  136 ++
  mem/hg_buddy.c              | 1651 ++++++++++++++++++++++++
  mem/hg_buddy.h              |  249 ++++
- mem/hg_large.c              |  426 +++++++
+ mem/hg_large.c              |  430 +++++++
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 2133 +++++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1541 +++++++++++++++++++++++
+ mem/hg_malloc.c             | 2161 +++++++++++++++++++++++++++++++
+ mem/hg_malloc.h             | 1580 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -100,7 +100,7 @@ procedures: mem/README.hg_malloc.md.
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 12052 insertions(+), 38 deletions(-)
+ 41 files changed, 12131 insertions(+), 38 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -433,10 +433,10 @@ index 5647ac79ea..172955ee9e 100644
  				auto_scaling_cycle=$3; }
  		| AUTO_SCALING_CYCLE EQUAL error {
 diff --git a/core_stats.c b/core_stats.c
-index 739a520700..5042ba62d9 100644
+index 739a520700..74ac2c7cf9 100644
 --- a/core_stats.c
 +++ b/core_stats.c
-@@ -186,6 +186,306 @@ static unsigned long get_pkg_fragments( void*proc_id)
+@@ -186,6 +186,307 @@ static unsigned long get_pkg_fragments( void*proc_id)
  	return pkg_status[(unsigned long)proc_id][PKG_FRAGMENTS_SIZE_IDX];
  }
  
@@ -682,6 +682,7 @@ index 739a520700..5042ba62d9 100644
 +
 +	if (slot == 0) {
 +		hg_grow_blocked_event(ticks);
++		hg_oom_report_shared();
 +
 +		/*
 +		 * Publish the sweep to threads IPC cannot reach BEFORE dispatching
@@ -743,7 +744,7 @@ index 739a520700..5042ba62d9 100644
  
  int init_pkg_stats(int procs_no)
  {
-@@ -328,3 +628,8 @@ int init_pkg_stats(int procs_no)
+@@ -328,3 +629,8 @@ int init_pkg_stats(int procs_no)
  #endif /* PKG */
  
  #endif /* STATISTICS */
@@ -1057,10 +1058,10 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..cd6c61ee11
+index 0000000000..c532035667
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,344 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
@@ -1210,6 +1211,7 @@ index 0000000000..cd6c61ee11
 +| notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
 +| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in the pool plus RAM above the floor | lower `-M` INIT or the worker counts, or add memory or huge pages |
 +| `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
++| `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 +| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
@@ -1515,10 +1517,10 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..f425f0bd21
+index 0000000000..693d6a4271
 --- /dev/null
 +++ b/mem/hg_arena.c
-@@ -0,0 +1,2367 @@
+@@ -0,0 +1,2373 @@
 +/*
 + * hugepage-backed slab allocator - arena internals
 + *
@@ -2476,6 +2478,7 @@ index 0000000000..f425f0bd21
 +void hg_cache_flush_self(void)
 +{
 +	int i, c;
++	unsigned long oom_n, oom_req;
 +
 +	for (i = 0; i < HG_MAX_INSTANCES; i++) {
 +		struct hg_palloc *pl = &palloc_slots[i];
@@ -2497,6 +2500,7 @@ index 0000000000..f425f0bd21
 +		hg_lock_enter(hb, HG_LK_FLUSH);
 +		hb->cache_flushes++;
 +		hb->cells_flushed += n;
++		oom_n = hb->shared ? 0 : hg_oom_take(hb, &oom_req);
 +		/* a PRIVATE arena's shrink gate ticks here - only its
 +		 * owning process can release its memory, and this runs in
 +		 * every process once per sweep. The shared arena is ticked
@@ -2513,6 +2517,8 @@ index 0000000000..f425f0bd21
 +				hg_pkg_publish(hb);
 +		}
 +		hg_lock_leave(hb);
++		if (oom_n)
++			hg_oom_report(hb, oom_n, oom_req);
 +		if (n)
 +			LM_DBG("%s: idle sweep returned %u cached cells\n", hb->name, n);
 +	}
@@ -2715,9 +2721,11 @@ index 0000000000..f425f0bd21
 +	/* the floor is evaluated inside the buddy layer now - see
 +	 * hg_reserve_floor_check() for why it cannot live here */
 +	if (!ch) {
-+		LM_ERR("%s: no more HG_MALLOC arena memory for a %u byte chunk "
-+			"(class %d, order %d) - increase the arena size\n",
-+			hb->name, size, c, ord);
++		if (hg_oom_first(hb, size))
++			LM_ERR("%s: no more HG_MALLOC arena memory for a %u byte "
++				"chunk (class %d, order %d) - increase the arena size; "
++				"further failures are summarised every 30 s\n",
++				hb->name, size, c, ord);
 +		return -1;
 +	}
 +
@@ -5942,10 +5950,10 @@ index 0000000000..5df00a0ef2
 +#endif /* HG_BUDDY_H */
 diff --git a/mem/hg_large.c b/mem/hg_large.c
 new file mode 100644
-index 0000000000..5fd6ce23f3
+index 0000000000..38ac5aa059
 --- /dev/null
 +++ b/mem/hg_large.c
-@@ -0,0 +1,426 @@
+@@ -0,0 +1,430 @@
 +/*
 + * hugepage-backed slab allocator - large-object tier
 + *
@@ -6138,10 +6146,14 @@ index 0000000000..5fd6ce23f3
 +			chunk_size &= ~63UL;
 +		}
 +		if (!base) {
++			int first = hg_oom_first(hb, need);
++
 +			hg_lock_leave(hb);
-+			LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "
-+				"large chunk (need %lu bytes for this allocation) - "
-+				"increase the arena size\n", hb->name, chunk_size, need);
++			if (first)
++				LM_ERR("%s: no more HG_MALLOC arena memory for a %lu byte "
++					"large chunk (need %lu bytes for this allocation) - "
++					"increase the arena size; further failures are "
++					"summarised every 30 s\n", hb->name, chunk_size, need);
 +			return NULL;
 +		}
 +
@@ -6746,10 +6758,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..fd9e51c816
+index 0000000000..36042bda7e
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,2133 @@
+@@ -0,0 +1,2161 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7439,6 +7451,34 @@ index 0000000000..fd9e51c816
 +		HG_SZ_VAL(need), HG_SZ_UNIT(need),
 +		room == ~0UL ? 0 : room >> 20, hg_ram_floor(), pool >> 20);
 +	return 0;
++}
++
++void hg_oom_report(struct hg_block *hb, unsigned long n, unsigned long max_req)
++{
++	LM_ERR("%s: %lu allocations failed in the last 30 s for lack of arena "
++		"memory (largest %lu %s) - the arena is full; increase it or find "
++		"what fills it (core:hg_stats)\n", hb->name, n,
++		HG_SZ_VAL(max_req), HG_SZ_UNIT(max_req));
++}
++
++/* the shared arenas (shm, module arenas), once per sweep interval from the
++ * sweep timer - every process sees them, so no per-process reporting */
++void hg_oom_report_shared(void)
++{
++	unsigned long n, max_req;
++	struct hg_block *hb;
++	int i;
++
++	for (i = 0; i < HG_ARENA_REG_MAX; i++) {
++		hb = hg_arena_reg[i].hb;
++		if (!hb || !hb->shared)
++			continue;
++		hg_lock_enter(hb, HG_LK_STATS);
++		n = hg_oom_take(hb, &max_req);
++		hg_lock_leave(hb);
++		if (n)
++			hg_oom_report(hb, n, max_req);
++	}
 +}
 +
 +/*
@@ -8885,10 +8925,10 @@ index 0000000000..fd9e51c816
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..a17efdb127
+index 0000000000..52895dca84
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1541 @@
+@@ -0,0 +1,1580 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -9529,6 +9569,13 @@ index 0000000000..a17efdb127
 +	unsigned long         grows;        /* successful commits */
 +	unsigned long         grow_bytes;   /* their total */
 +	unsigned long         grow_refused; /* refusals (cap or resource) */
++	/* allocation-failure log throttle: the first failure of an episode is
++	 * logged in full, the rest are counted and summarised at the sweep
++	 * (hg_oom_take()); a quiet interval ends the episode */
++	unsigned long         oom_fails;
++	unsigned long         oom_fails_said;
++	unsigned long         oom_max_req;
++	unsigned int          oom_episode;
 +	unsigned long         shrinks;      /* successful releases */
 +	unsigned long         shrink_bytes; /* their total */
 +	/*
@@ -9935,6 +9982,38 @@ index 0000000000..a17efdb127
 + * hgmem:hg_pkg_grow_blocked (processes blocked now) via hg_pkg_pub_stat().
 + * hg_pkg_pub_reset() clears a slot when its process is gone.
 + */
++/* allocation-failure throttle, hb->lock held: hg_oom_first() counts a
++ * failure and says whether to log it in full; hg_oom_take() returns the
++ * failures since the last call (and the largest request), ending the
++ * episode after a quiet interval. hg_oom_report_shared() logs the shared
++ * arenas' summaries once per sweep interval. */
++static inline int hg_oom_first(struct hg_block *hb, unsigned long req)
++{
++	hb->oom_fails++;
++	if (req > hb->oom_max_req)
++		hb->oom_max_req = req;
++	if (hb->oom_episode)
++		return 0;
++	hb->oom_episode = 1;
++	return 1;
++}
++
++static inline unsigned long hg_oom_take(struct hg_block *hb,
++		unsigned long *max_req)
++{
++	unsigned long n = hb->oom_fails - hb->oom_fails_said;
++
++	*max_req = hb->oom_max_req;
++	hb->oom_fails_said = hb->oom_fails;
++	hb->oom_max_req = 0;
++	if (!n)
++		hb->oom_episode = 0;
++	return n;
++}
++
++void hg_oom_report(struct hg_block *hb, unsigned long n, unsigned long max_req);
++void hg_oom_report_shared(void);
++
 +int hg_pkg_pub_init(unsigned int nproc);
 +void hg_pkg_publish(struct hg_block *hb);
 +void hg_pkg_pub_reset(int proc);

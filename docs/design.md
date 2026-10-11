@@ -147,6 +147,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
 | startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in the pool plus RAM above the floor | lower `-M` INIT or the worker counts, or add memory or huge pages |
 | `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
+| `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 | `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 | `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 | arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
