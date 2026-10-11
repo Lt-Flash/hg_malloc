@@ -1,8 +1,7 @@
-From c75208446d7db872b4bc4fe76466dc0f31d4c121 Mon Sep 17 00:00:00 2001
+From 6bd3352a09fcfbdfe31729690ba0adc433f33663 Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
-Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
- arenas
+Subject: [PATCH] mem: HG_MALLOC - slab allocator with elastic arenas
 
 A new shared- and private-memory allocator, selected at runtime with
 -a HG_MALLOC (or -s/-k for one memory type); no behaviour change for
@@ -12,10 +11,11 @@ existing configurations.
    the common allocation and free take no lock; cells move between
    processes through a shared per-class pool, in batches. Larger requests
    go to a coalescing large tier.
- - Blocks are carved from a buddy allocator inside each huge page (2 MB
-   on x86-64); a block whose cells are all free returns to the buddy and
-   can be re-cut for any class.
- - The arena is acquired through a four-step ladder - MAP_HUGETLB, THP via
+ - Blocks are carved from a buddy allocator over a grid of pages the size
+   of the host's huge page (2 MB on x86-64; 256 KB for small arenas on
+   4 KB memory), whichever tier backs them; a block whose cells are all
+   free returns to the buddy and can be re-cut for any class.
+ - The arena is acquired through a four-tier ladder - MAP_HUGETLB, THP via
    MADV_HUGEPAGE, MADV_COLLAPSE, plain 4 KB pages - each tier verified from
    the kernel's counters. Huge pages are an optimisation, not a requirement.
  - Elastic arenas: -m INIT:CAP / -M INIT:CAP (k/m/g suffixes, bare numbers
@@ -28,7 +28,8 @@ existing configurations.
    sustained refusal by the backing or the floor latches GROW-BLOCKED,
    raised as E_CORE_SHM_GROW_BLOCKED (reaching the cap is only a notice).
  - Host memory is checked before anything is committed, on every tier
-   (the hugetlb pool, else MemAvailable above hg_ram_floor_mb): at startup
+   (MemAvailable above hg_ram_floor_mb, plus the hugetlb pool for arenas
+   on hugetlb pages): at startup
    for every process's -M INIT (refuse when the startup processes do not
    fit, warn for the auto-scaling maximum and for caps beyond MemTotal),
    before each fork (an auto-scaler fork that does not fit is skipped),
@@ -1063,7 +1064,7 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..9b99ec6083
+index 0000000000..e4c37fc110
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
 @@ -0,0 +1,344 @@
@@ -1077,7 +1078,7 @@ index 0000000000..9b99ec6083
 +
 +**The common path takes no lock.** Each process (and each thread of a threaded process) keeps a private free list per class. An allocation pops from it and a free pushes to it - no lock, no shared cache line. When a private list runs dry it refills a batch from a shared per-class pool; when it grows past its threshold it donates a batch back. Only those batch transfers take the arena lock.
 +
-+**Blocks and the buddy allocator.** The arena is a grid of huge pages - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
++**Blocks and the buddy allocator.** The arena is a grid of pages the size of the host's huge page - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages - whichever of the four tiers backs them. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
 +
 +**Small arenas.** An arena with an INIT under one huge page settles its page size by the backing it gets. On plain 4 KB memory it runs in small mode, on 256 KB pages: at least 256 KB with a cap, 512 KB without. On huge pages its INIT is raised to one huge page, and an arena whose cap leaves no room above that page is refused at startup.
 +
@@ -1131,18 +1132,18 @@ index 0000000000..9b99ec6083
 +| limit | what | refusal |
 +|---|---|---|
 +| admin | the profile's scale-up target, else the cap | logged as a notice - a limit doing its job |
-+| backing | the hugetlb pool (tier 1, checked at startup), or `mlock()` | resource refusal |
++| backing | the kernel failing to back the memory; on tier 1 also the hugetlb pool (checked at startup) or the memory-lock limit | resource refusal |
 +| host memory | `MemAvailable` must stay above `hg_ram_floor_mb` (default max(256 MB, MemTotal/20)) | resource refusal |
 +
 +The host-memory check charges a private-arena step once per OpenSIPS process, since every process grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
 +
-+The same floor guards the INITs: at startup every process's private arena is checked against the pool and RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
++The same floor guards the INITs: at startup every process's private arena is checked against RAM (and the hugetlb pool, if the host has one) before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
 +
 +On hugetlb pages every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too, so there a low limit refuses growth: the arena warns at startup, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4 the pin is a latency guarantee, not a requirement: an arena that could not pin its initial size runs unpinned, and a grow the limit cannot cover continues unpinned instead of being refused (section 8).
 +
 +### 3.3 GROW-BLOCKED
 +
-+Only resource refusals count: the memory-lock limit, the hugetlb pool, or the host floor. Reaching the cap or the profile's scale-up target is a limit doing its job: it is logged once as a notice and counted in `grow_refused`, and never latches.
++Only resource refusals count: on any tier the host floor or the kernel failing to back the memory, and on hugetlb pages also the memory-lock limit or the pool. Reaching the cap or the profile's scale-up target is a limit doing its job: it is logged once as a notice and counted in `grow_refused`, and never latches.
 +
 +A resource refusal that persists is an incident; a single one is not. The first refusal arms the state. It latches at the next 30 s sweep tick if refusals continued, or sooner if a reclaim pass did not help. It clears on the next successful grow, or when free space recovers above twice the reserve floor. Isolated refusals never latch.
 +
@@ -1214,7 +1215,7 @@ index 0000000000..9b99ec6083
 +| startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
 +| startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
 +| notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
-+| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in the pool plus RAM above the floor | lower `-M` INIT or the worker counts, or add memory or huge pages |
++| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in RAM above the floor (plus the hugetlb pool, if any) | lower `-M` INIT or the worker counts, or add memory or huge pages |
 +| `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
 +| `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
@@ -1309,7 +1310,7 @@ index 0000000000..9b99ec6083
 +
 +#### E_CORE_SHM_GROW_BLOCKED
 +
-+The shared arena needs to grow and a resource refuses: the memory-lock limit (on hugetlb pages), the hugetlb pool, or the host floor (`hg_ram_floor_mb`). Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
++The shared arena needs to grow and a resource refuses: on any tier the host floor (`hg_ram_floor_mb`) or the kernel failing to back the memory, and on hugetlb pages also the memory-lock limit or the pool. Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
 +
 +| parameter | meaning |
 +|---|---|
@@ -1318,7 +1319,7 @@ index 0000000000..9b99ec6083
 +| `cap_mb` | the `-m` cap - committed is below it, since a full arena does not raise this event |
 +| `grow_refused` | refused grows so far |
 +
-+What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
++What to do: free or add host memory, or on hugetlb pages raise the memory-lock limit or the pool - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
 +
 +#### E_CORE_HG_LOCK_STALL
 +
@@ -1392,16 +1393,16 @@ index 0000000000..9b99ec6083
 +### Host requirements
 +
 +- `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`, so the arena stays pinned. Required for an elastic arena on hugetlb pages: every grow there is an `mlock()`, which checks the limit on hugetlb mappings too, and a refused grow names the limit or the hugetlb pool, whichever ran out. Recommended on tiers 2-4: without it the arena runs and grows unpinned (swappable) instead of refusing. HG warns at startup when the limit is too low.
-+- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
++- Huge pages are optional; without them every arena runs on plain 4 KB pages. To use them, provide either or both of:
 +  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
 +  - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
 +
 +### Host memory checks
 +
-+The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
++The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`, and memory on hugetlb pages against the pool. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 +
 +- **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
-+- **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
++- **Private arenas at startup, before anything forks:** every process's private arena is simulated against RAM above the floor, after whatever the hugetlb pool (if the host has one) can take. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 +- **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 +- **Every arena:** an INIT the host cannot hold is refused when the arena is created.
 +- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
@@ -1522,12 +1523,12 @@ index ccba6d5e3b..216a52dbdb 100644
  typedef void *(*osips_block_malloc_f) (void *block, unsigned long size,
 diff --git a/mem/hg_arena.c b/mem/hg_arena.c
 new file mode 100644
-index 0000000000..978a477d9e
+index 0000000000..1c7523f9eb
 --- /dev/null
 +++ b/mem/hg_arena.c
 @@ -0,0 +1,2411 @@
 +/*
-+ * hugepage-backed slab allocator - arena internals
++ * slab allocator with elastic arenas - arena internals
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -3939,12 +3940,12 @@ index 0000000000..978a477d9e
 +         * meaningful without the allocator. */
 diff --git a/mem/hg_arena.h b/mem/hg_arena.h
 new file mode 100644
-index 0000000000..f67128179d
+index 0000000000..8e6bd4f09d
 --- /dev/null
 +++ b/mem/hg_arena.h
 @@ -0,0 +1,136 @@
 +/*
-+ * hugepage-backed slab allocator - arena internals
++ * slab allocator with elastic arenas - arena internals
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -4081,12 +4082,12 @@ index 0000000000..f67128179d
 +#endif /* hg_arena_h */
 diff --git a/mem/hg_buddy.c b/mem/hg_buddy.c
 new file mode 100644
-index 0000000000..d5bc0c1bcb
+index 0000000000..18fab7fd31
 --- /dev/null
 +++ b/mem/hg_buddy.c
 @@ -0,0 +1,1651 @@
 +/*
-+ * buddy allocator over the HG_MALLOC huge-page grid
++ * buddy allocator over the HG_MALLOC page grid
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -5738,12 +5739,12 @@ index 0000000000..d5bc0c1bcb
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_buddy.h b/mem/hg_buddy.h
 new file mode 100644
-index 0000000000..5df00a0ef2
+index 0000000000..a3a9fcaa49
 --- /dev/null
 +++ b/mem/hg_buddy.h
 @@ -0,0 +1,249 @@
 +/*
-+ * buddy allocator over the HG_MALLOC huge-page grid
++ * buddy allocator over the HG_MALLOC page grid
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -5993,12 +5994,12 @@ index 0000000000..5df00a0ef2
 +#endif /* HG_BUDDY_H */
 diff --git a/mem/hg_large.c b/mem/hg_large.c
 new file mode 100644
-index 0000000000..38ac5aa059
+index 0000000000..3cd64af360
 --- /dev/null
 +++ b/mem/hg_large.c
 @@ -0,0 +1,430 @@
 +/*
-+ * hugepage-backed slab allocator - large-object tier
++ * slab allocator with elastic arenas - large-object tier
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -6429,12 +6430,12 @@ index 0000000000..38ac5aa059
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_large.h b/mem/hg_large.h
 new file mode 100644
-index 0000000000..3e4d0dafc0
+index 0000000000..fbe3dc60e3
 --- /dev/null
 +++ b/mem/hg_large.h
 @@ -0,0 +1,102 @@
 +/*
-+ * hugepage-backed slab allocator - large-object tier
++ * slab allocator with elastic arenas - large-object tier
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -6801,12 +6802,12 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..291f568d18
+index 0000000000..56ff2ab144
 --- /dev/null
 +++ b/mem/hg_malloc.c
 @@ -0,0 +1,2214 @@
 +/*
-+ * hugepage-backed slab allocator
++ * slab allocator with elastic arenas
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *
@@ -8430,7 +8431,7 @@ index 0000000000..291f568d18
 +	apage = hg_arena_page(size, cap);
 +	/* INIT under one huge page with a cap at or above it: the backing the
 +	 * arena gets decides the page unit, so the reservation is made on the
-+	 * huge-page grid and INIT is settled once the tier is known (below) */
++	 * page grid and INIT is settled once the tier is known (below) */
 +	tier_decides = (apage == HG_HPS && size < HG_HPS);
 +	/* a small-mode arena with room above it can start on one page: what
 +	 * does not fit grows the arena instead of failing */
@@ -9021,12 +9022,12 @@ index 0000000000..291f568d18
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..2512c09a47
+index 0000000000..2bf9e035fd
 --- /dev/null
 +++ b/mem/hg_malloc.h
 @@ -0,0 +1,1584 @@
 +/*
-+ * hugepage-backed slab allocator
++ * slab allocator with elastic arenas
 + *
 + * Copyright (C) 2026 Yury Kirsanov
 + *

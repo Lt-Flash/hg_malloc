@@ -17,8 +17,8 @@ Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchm
 ## How it works
 
 - **Lock-free common path.** 21 size classes from 64 B to 64 KB, served from a private free list per process: an allocation and the free that returns it take no lock and touch no shared cache line. Cells move between processes through a shared per-class pool, in batches.
-- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator inside each huge page (2 MB on x86-64); a block whose cells are all free returns to the buddy and can be re-cut for any size class.
-- **Huge pages when available.** The arena is acquired through a four-step ladder - `MAP_HUGETLB`, transparent huge pages by advice, by collapse, then plain 4 KB pages - each tier verified from the kernel's own counters.
+- **Memory is reused, not stranded.** Blocks are carved from a buddy allocator over a grid of pages the size of the host's huge page (2 MB on x86-64), whichever tier backs them; a block whose cells are all free returns to the buddy and can be re-cut for any size class.
+- **Four tiers of backing memory.** The arena is acquired through a four-tier ladder - `MAP_HUGETLB`, transparent huge pages by advice, by collapse, then plain 4 KB pages - each tier verified from the kernel's own counters. Huge pages are optional.
 - **Elastic arenas.** `-m INIT:CAP` reserves the cap and commits pages only as needed; a maintenance process grows ahead of demand and releases quiet pages with the arena lock dropped. Growth stops at the cap, at what the backing tier can give, and at a floor of host free memory - and when the backing or host memory keeps refusing, an alertable event is raised.
 - **No OOM surprises.** Every arena's INIT - the shared `-m` and each process's `-M` - is checked against host memory before it is committed: OpenSIPS refuses a combination the host cannot hold at startup, and shared-arena growth and the auto-scaler both stop at a host free-memory floor instead of running into the OOM killer.
 
@@ -57,7 +57,7 @@ LimitMEMLOCK=infinity
 
 With a lower limit, HG runs and grows unpinned on THP and 4 KB pages, but on hugetlb pages an elastic arena cannot grow past the limit. HG warns at startup, and under `opensips -C`, when the limit is too low.
 
-**Enable huge pages on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
+**To use huge pages, enable them on the host first.** HG uses only what the host offers. With no hugetlb pool and transparent huge pages turned off, every arena drops through the ladder to plain 4 KB pages. It still works, but without the huge-page gain. Configure one or both:
 
 ```bash
 # Tier 1 - hugetlb pool: shm cap + pkg cap x processes, in 2 MB pages, ~12% margin.

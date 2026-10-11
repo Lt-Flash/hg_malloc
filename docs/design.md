@@ -8,7 +8,7 @@ How HG_MALLOC works, what it guarantees, and how to run and monitor it. For the 
 
 **The common path takes no lock.** Each process (and each thread of a threaded process) keeps a private free list per class. An allocation pops from it and a free pushes to it - no lock, no shared cache line. When a private list runs dry it refills a batch from a shared per-class pool; when it grows past its threshold it donates a batch back. Only those batch transfers take the arena lock.
 
-**Blocks and the buddy allocator.** The arena is a grid of huge pages - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
+**Blocks and the buddy allocator.** The arena is a grid of pages the size of the host's huge page - 2 MB on x86-64, larger on arm64 kernels with 16 KB or 64 KB base pages - whichever of the four tiers backs them. A buddy allocator inside each page hands out blocks, and a block is carved into cells of one class. The shared pool keeps each block's free cells on that block and refills from the fullest partially-used block, so emptier blocks drain completely. A block whose cells are all free goes back to the buddy and can be re-cut for any class - memory used by a burst of one size is not stranded there.
 
 **Small arenas.** An arena with an INIT under one huge page settles its page size by the backing it gets. On plain 4 KB memory it runs in small mode, on 256 KB pages: at least 256 KB with a cap, 512 KB without. On huge pages its INIT is raised to one huge page, and an arena whose cap leaves no room above that page is refused at startup.
 
@@ -62,18 +62,18 @@ Growth stops at the smallest of three limits:
 | limit | what | refusal |
 |---|---|---|
 | admin | the profile's scale-up target, else the cap | logged as a notice - a limit doing its job |
-| backing | the hugetlb pool (tier 1, checked at startup), or `mlock()` | resource refusal |
+| backing | the kernel failing to back the memory; on tier 1 also the hugetlb pool (checked at startup) or the memory-lock limit | resource refusal |
 | host memory | `MemAvailable` must stay above `hg_ram_floor_mb` (default max(256 MB, MemTotal/20)) | resource refusal |
 
 The host-memory check charges a private-arena step once per OpenSIPS process, since every process grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
 
-The same floor guards the INITs: at startup every process's private arena is checked against the pool and RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](configuration.md#host-memory-checks)).
+The same floor guards the INITs: at startup every process's private arena is checked against RAM (and the hugetlb pool, if the host has one) before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](configuration.md#host-memory-checks)).
 
 On hugetlb pages every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too, so there a low limit refuses growth: the arena warns at startup, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4 the pin is a latency guarantee, not a requirement: an arena that could not pin its initial size runs unpinned, and a grow the limit cannot cover continues unpinned instead of being refused (section 8).
 
 ### 3.3 GROW-BLOCKED
 
-Only resource refusals count: the memory-lock limit, the hugetlb pool, or the host floor. Reaching the cap or the profile's scale-up target is a limit doing its job: it is logged once as a notice and counted in `grow_refused`, and never latches.
+Only resource refusals count: on any tier the host floor or the kernel failing to back the memory, and on hugetlb pages also the memory-lock limit or the pool. Reaching the cap or the profile's scale-up target is a limit doing its job: it is logged once as a notice and counted in `grow_refused`, and never latches.
 
 A resource refusal that persists is an incident; a single one is not. The first refusal arms the state. It latches at the next 30 s sweep tick if refusals continued, or sooner if a reclaim pass did not help. It clears on the next successful grow, or when free space recovers above twice the reserve floor. Isolated refusals never latch.
 
@@ -145,7 +145,7 @@ A module can ask for its own HG-managed arena with `mem/mem_arena.h` - for a cac
 | startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
 | startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
 | notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
-| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in the pool plus RAM above the floor | lower `-M` INIT or the worker counts, or add memory or huge pages |
+| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in RAM above the floor (plus the hugetlb pool, if any) | lower `-M` INIT or the worker counts, or add memory or huge pages |
 | `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
 | `no more HG_MALLOC arena memory ...`, then `N allocations failed in the last 30 s` | the arena is full and cannot grow (cap reached, or growth refused) | raise the cap or the host's free memory; `core:hg_stats` shows what fills it. The first failure of an episode is logged in full, the rest are summarised every 30 s |
 | `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |

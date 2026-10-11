@@ -78,7 +78,7 @@ Both events describe the shared arena and are raised from the 30 s cache-sweep t
 
 ### E_CORE_SHM_GROW_BLOCKED
 
-The shared arena needs to grow and a resource refuses: the memory-lock limit (on hugetlb pages), the hugetlb pool, or the host floor (`hg_ram_floor_mb`). Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
+The shared arena needs to grow and a resource refuses: on any tier the host floor (`hg_ram_floor_mb`) or the kernel failing to back the memory, and on hugetlb pages also the memory-lock limit or the pool. Reaching the `-m` cap or the profile's scale-up target does not raise it - that is logged once as a notice and counted in `hg_shm_grow_refused`. A single refusal does not raise it either: the first refusal arms the state, which latches at the next 30 s sweep tick if refusals continued (or sooner if a reclaim pass did not help). The event is raised at the sweep tick after the state latches and again periodically while it lasts. A successful grow, or free space recovering above twice the reserve floor, clears it.
 
 | parameter | meaning |
 |---|---|
@@ -87,7 +87,7 @@ The shared arena needs to grow and a resource refuses: the memory-lock limit (on
 | `cap_mb` | the `-m` cap - committed is below it, since a full arena does not raise this event |
 | `grow_refused` | refused grows so far |
 
-What to do: raise the memory-lock limit, the hugetlb pool or the host's free memory - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
+What to do: free or add host memory, or on hugetlb pages raise the memory-lock limit or the pool - whichever the log names - or find what is filling the arena (`core:hg_stats`, `core:hg_advise`). With no subscriber the same moment is logged as a warning, and the `hgmem:hg_shm_grow_blocked` statistic reads 1 while it lasts.
 
 ### E_CORE_HG_LOCK_STALL
 
@@ -161,16 +161,16 @@ Note that `shmem:free_size` counts only memory not yet carved into size-class bl
 ## Host requirements
 
 - `LimitMEMLOCK=infinity` in the service unit, or `ulimit -l unlimited`, so the arena stays pinned. Required for an elastic arena on hugetlb pages: every grow there is an `mlock()`, which checks the limit on hugetlb mappings too, and a refused grow names the limit or the hugetlb pool, whichever ran out. Recommended on tiers 2-4: without it the arena runs and grows unpinned (swappable) instead of refusing. HG warns at startup when the limit is too low.
-- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
+- Huge pages are optional; without them every arena runs on plain 4 KB pages. To use them, provide either or both of:
   - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
   - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
 
 ## Host memory checks
 
-The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
+The shared arena commits its `-m` INIT at startup, and every process then creates its own private arena and commits its `-M` INIT, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`, and memory on hugetlb pages against the pool. The shared arena is checked first (against the default floor - the config is not read yet), and every later check counts what is left after it.
 
 - **Shared arena:** its INIT is refused if the host cannot hold it; its growth is refused at the floor (GROW-BLOCKED, `hg_shm_grow_blocked`).
-- **Private arenas at startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
+- **Private arenas at startup, before anything forks:** every process's private arena is simulated against RAM above the floor, after whatever the hugetlb pool (if the host has one) can take. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
 - **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
 - **Every arena:** an INIT the host cannot hold is refused when the arena is created.
 - **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process. Private-arena refusals show in `hg_pkg_grow_refused` and `hg_pkg_grow_blocked`.
