@@ -11,7 +11,7 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 - **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
-Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchmarks](docs/benchmarks.md). In production on 11 SIP nodes (SBCs and registrars) since October 2026.
+Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchmarks](docs/benchmarks.md). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
 
 ## How it works
 
