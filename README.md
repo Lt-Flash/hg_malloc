@@ -19,6 +19,7 @@ Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchm
 - **Memory is reused, not stranded.** Blocks are carved from a buddy allocator inside each huge page (2 MB on x86-64); a block whose cells are all free returns to the buddy and can be re-cut for any size class.
 - **Huge pages when available.** The arena is acquired through a four-step ladder - `MAP_HUGETLB`, transparent huge pages by advice, by collapse, then plain 4 KB pages - each tier verified from the kernel's own counters.
 - **Elastic arenas.** `-m INIT:CAP` reserves the cap and commits pages only as needed; a maintenance process grows ahead of demand and releases quiet pages with the arena lock dropped. Growth stops at the cap, at what the backing tier can give, and at a floor of host free memory - and when the backing or host memory keeps refusing, an alertable event is raised.
+- **No OOM surprises.** Every process's INIT is checked against host memory before it is committed: OpenSIPS refuses a startup process count the host cannot hold, and the auto-scaler stops forking at the limit instead of running into the OOM killer.
 
 The full design, with measurements behind each decision: [docs/design.md](docs/design.md).
 

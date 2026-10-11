@@ -1,4 +1,4 @@
-From 239a465f3c0472cf199360487d0f78ca3bc9b488 Mon Sep 17 00:00:00 2001
+From 013bd4a2e5b04fd5a198a96996434c7e596a96fd Mon Sep 17 00:00:00 2001
 From: Yury Kirsanov <yury@kfi.net.au>
 Date: Sun, 11 Oct 2026 11:32:11 +1100
 Subject: [PATCH] mem: HG_MALLOC - hugepage-backed slab allocator with elastic
@@ -27,6 +27,12 @@ existing configurations.
    the backing tier and a host free-memory floor (hg_ram_floor_mb); a
    sustained refusal by the backing or the floor latches GROW-BLOCKED,
    raised as E_CORE_SHM_GROW_BLOCKED (reaching the cap is only a notice).
+ - Host memory is checked before anything is committed, on every tier
+   (the hugetlb pool, else MemAvailable above hg_ram_floor_mb): at startup
+   for every process's -M INIT (refuse when the startup processes do not
+   fit, warn for the auto-scaling maximum and for caps beyond MemTotal),
+   before each fork (an auto-scaler fork that does not fit is skipped),
+   and on each arena creation and grow.
  - Every grow is an mlock() of the new range, and mlock() checks
    RLIMIT_MEMLOCK on hugetlb as well: the arena warns at startup (and under
    -C) when the limit cannot cover its growth, and a refused grow names the
@@ -64,7 +70,7 @@ procedures: mem/README.hg_malloc.md.
  globals.h                   |   25 +
  help_msg.h                  |    6 +-
  main.c                      |   98 +-
- mem/README.hg_malloc.md     |  321 +++++
+ mem/README.hg_malloc.md     |  340 +++++
  mem/common.c                |   14 +
  mem/common.h                |   27 +-
  mem/hg_arena.c              | 2346 +++++++++++++++++++++++++++++++++++
@@ -75,8 +81,8 @@ procedures: mem/README.hg_malloc.md.
  mem/hg_large.h              |  102 ++
  mem/hg_maint.c              |  213 ++++
  mem/hg_maint.h              |   39 +
- mem/hg_malloc.c             | 1886 ++++++++++++++++++++++++++++
- mem/hg_malloc.h             | 1516 ++++++++++++++++++++++
+ mem/hg_malloc.c             | 2073 +++++++++++++++++++++++++++++++
+ mem/hg_malloc.h             | 1529 +++++++++++++++++++++++
  mem/hg_malloc_dyn.h         |  203 +++
  mem/hg_version.h            |   33 +
  mem/mem.c                   |   64 +-
@@ -87,13 +93,13 @@ procedures: mem/README.hg_malloc.md.
  mi/mi_core.c                |  730 +++++++++++
  modules/hgstress/Makefile   |    9 +
  modules/hgstress/hgstress.c |  576 +++++++++
- pt.c                        |  113 ++
+ pt.c                        |  128 ++
  pt_scaling.c                |   22 +-
  pt_scaling.h                |    5 +
  socket_info.c               |   16 +
  statistics.c                |    9 +
  version.h                   |    9 +-
- 41 files changed, 11715 insertions(+), 38 deletions(-)
+ 41 files changed, 11949 insertions(+), 38 deletions(-)
  create mode 100644 mem/README.hg_malloc.md
  create mode 100644 mem/hg_arena.c
  create mode 100644 mem/hg_arena.h
@@ -1050,10 +1056,10 @@ index c0684745f4..78157e3cf1 100644
  #endif
 diff --git a/mem/README.hg_malloc.md b/mem/README.hg_malloc.md
 new file mode 100644
-index 0000000000..dfa4ad249b
+index 0000000000..dcda99d1aa
 --- /dev/null
 +++ b/mem/README.hg_malloc.md
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,340 @@
 +# HG_MALLOC
 +
 +A memory allocator for shared and private memory, selected at runtime with `-a HG_MALLOC`. This document covers how it works, how to configure, run and monitor it. Measurements: https://github.com/Lt-Flash/hg_malloc/blob/main/docs/benchmarks.md
@@ -1122,6 +1128,8 @@ index 0000000000..dfa4ad249b
 +| host memory | `MemAvailable` must stay above `hg_ram_floor_mb` (default max(256 MB, MemTotal/20)) | resource refusal |
 +
 +The host-memory check charges a private-arena step once per OpenSIPS process, since every process grows its own under the same load. Tier 1 skips it: hugetlb pages were taken from host memory when the pool was created.
++
++The same floor guards the INITs: at startup every process's private arena is checked against the pool and RAM before anything forks, and each later fork - the auto-scaler's included - is skipped if its INIT does not fit (see [Host memory checks](#host-memory-checks)).
 +
 +Every grow is an `mlock()` of the new range, and `mlock()` checks `RLIMIT_MEMLOCK` on hugetlb mappings too. An elastic arena warns at startup when the limit cannot cover its growth, and a refused grow names the resource that ran out - the limit, or the hugetlb pool. On tiers 2-4, an arena that could not pin its initial size runs unpinned, and its grows are populated without pinning instead of refused (section 8).
 +
@@ -1199,6 +1207,8 @@ index 0000000000..dfa4ad249b
 +| startup: `below the 512 KB minimum viable arena` | a fixed arena (no cap) under 512 KB | give a cap (`-M 256k:2m`) or INIT of at least 512 KB |
 +| startup: `on huge pages INIT is at least one huge page ... no room to grow` | INIT under 2 MB on huge pages with a cap of 2 MB or less | raise the cap, or give INIT as 2 MB for a fixed arena |
 +| notice: `INIT raised from ... to 2 MB` | INIT under 2 MB on huge pages | expected; give INIT as 2 MB to silence it |
++| startup: `the N processes started now need ... MB of RAM` | `-M` INIT x processes does not fit in the pool plus RAM above the floor | lower `-M` INIT or the worker counts, or add memory or huge pages |
++| `not forking more processes until memory frees up` | the auto-scaler wants a process whose INIT does not fit | lower the scale-up maximum or `-M` INIT; OpenSIPS keeps running meanwhile |
 +| `the arena has no growth room` | a profile is attached but `-m`/`-M` has no cap | add the cap: `-m 128:1024` |
 +| `scale-up target ... exceeds the ... reservation` | the profile wants more than the cap | raise the cap or lower the target |
 +| arena runs unpinned (`continuing unpinned`) | memory lock limit too low on tiers 2-4 | `LimitMEMLOCK=infinity`; meanwhile the arena grows unpinned rather than refusing |
@@ -1268,7 +1278,7 @@ index 0000000000..dfa4ad249b
 +| `pkg_auto_scaling_profile` | none | profile that drives each process's private arena |
 +| `shm_grow_granule` | 16m (one page on a small arena) | size of one grow step of the shared arena, rounded to the arena page |
 +| `pkg_grow_granule` | 16m (one page on a small arena) | the same for every process's private arena |
-+| `hg_ram_floor_mb` | 0 = max(256 MB, MemTotal/20) | host free memory a grow may never take the host below |
++| `hg_ram_floor_mb` | 0 = max(256 MB, MemTotal/20) | host free memory no commit may take the host below: checked at startup, before each new process is forked, and on every grow |
 +| `hg_autoscale_dry_run` | 0 | 1 = advise only: no growth of any kind and no shrink; logs what it would have done once per episode and counts suppressed grows in `hg_shm_grow_refused`. Allocations beyond the initial size fail |
 +| `hg_grow_ahead` | 1 | keep free headroom by growing one step before an allocation has to |
 +| `hg_scaling_cycle` | 30 | seconds per policy cycle of shared arenas (the profile's "cycles"); private arenas use the fixed 30 s sweep |
@@ -1375,6 +1385,21 @@ index 0000000000..dfa4ad249b
 +- Huge pages must be enabled on the host, or every arena falls through to plain 4 KB pages. Either or both of:
 +  - a hugetlb pool (tier 1): `vm.nr_hugepages` large enough for the shared cap plus the private arenas, in huge pages (2 MB on x86-64). On this tier the whole cap is reserved from the pool when the arena is created. A pool that can hold the initial size but not the cap gives a fixed arena on huge pages instead of an elastic one, and says so; a pool that cannot hold even the initial size leaves the arena on THP, still elastic.
 +  - transparent huge pages (tiers 2-3): `/sys/kernel/mm/transparent_hugepage/enabled` set to `madvise` or `always` for the private arenas, and `/sys/kernel/mm/transparent_hugepage/shmem_enabled` set to `advise` or `always` for the shared arena. Many distributions ship `shmem_enabled=never`. `MADV_COLLAPSE` (tier 3) needs Linux 6.1 or later.
++
++### Host memory checks
++
++Every process creates its own private arena and commits its `-M` INIT at once, so the number of processes matters as much as the sizes. HG checks before it commits, on every tier: huge-page memory against the hugetlb pool, THP and 4 KB memory against `MemAvailable` above `hg_ram_floor_mb`.
++
++- **Startup, before anything forks:** every process's private arena is simulated against the pool, then RAM. OpenSIPS refuses to start if the processes started at startup do not fit, and warns if the auto-scaling maximum does not, or if the `-m` cap plus `-M` cap x processes exceeds `MemTotal`. An INFO line gives the numbers.
++- **Each new process, auto-scaler forks included:** not forked if its INIT does not fit. The auto-scaler keeps the processes it has and tries again on its next cycle, so a profile that allows more processes than the host holds stops short instead of running into the OOM killer.
++- **Every arena:** an INIT the host cannot hold is refused when the arena is created.
++- **Every grow:** refused if it would cross the floor; a private-arena step is counted once per process.
++
++```
++INFO:  pkg: 14 processes at startup, up to 16 with auto-scaling, -M INIT 32 MB: 192 MB from the hugetlb pool, 224 MB (288 MB at the maximum) from RAM; 0 MB of RAM available above the 11778 MB floor
++ERROR: pkg: the 14 processes started now need 224 MB of RAM for their -M INIT of 32 MB (after 192 MB from the hugetlb pool), but 0 MB is available above the 11778 MB floor. ...
++ERROR: new process's pkg arena: committing 32 MB now does not fit - ... not forking more processes until memory frees up
++```
 diff --git a/mem/common.c b/mem/common.c
 index 598b351600..a953b2bf7a 100644
 --- a/mem/common.c
@@ -6694,10 +6719,10 @@ index 0000000000..cb2e4ceede
 +#endif /* hg_maint_h */
 diff --git a/mem/hg_malloc.c b/mem/hg_malloc.c
 new file mode 100644
-index 0000000000..9351f6ee3f
+index 0000000000..99e2dfc62b
 --- /dev/null
 +++ b/mem/hg_malloc.c
-@@ -0,0 +1,1886 @@
+@@ -0,0 +1,2073 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -7317,6 +7342,199 @@ index 0000000000..9351f6ee3f
 +#endif /* __OS_linux */
 +}
 +
++/* the host-memory floor no commit may cross, in MB: hg_ram_floor_mb from
++ * the config, else max(256 MB, MemTotal/20). Not cached: arenas created
++ * before the config is parsed must not pin the default for later grows. */
++static long hg_ram_floor(void)
++{
++	long total_kb, floor_mb;
++
++	if (hg_ram_floor_mb > 0)
++		return hg_ram_floor_mb;
++	floor_mb = 256;
++	total_kb = hg_meminfo_kb("MemTotal");
++	if (total_kb > 0 && total_kb / 20 / 1024 > floor_mb)
++		floor_mb = total_kb / 20 / 1024;
++	return floor_mb;
++}
++
++/* bytes the hugetlb pool can still hand out: free pages not already
++ * promised to a mapping */
++static unsigned long hg_pool_free_bytes(void)
++{
++	long free_pg = hg_meminfo_kb("HugePages_Free");
++	long rsvd_pg = hg_meminfo_kb("HugePages_Rsvd");
++	long page_kb = hg_meminfo_kb("Hugepagesize");
++
++	if (free_pg < 0 || rsvd_pg < 0 || page_kb <= 0 || free_pg <= rsvd_pg)
++		return 0;
++	return (unsigned long)(free_pg - rsvd_pg) * ((unsigned long)page_kb << 10);
++}
++
++/* bytes of general RAM that can still be committed above the floor;
++ * ULONG_MAX when the kernel does not say */
++static unsigned long hg_ram_room(void)
++{
++	long avail_kb = hg_meminfo_kb("MemAvailable");
++	unsigned long floor_b = (unsigned long)hg_ram_floor() << 20;
++
++	if (avail_kb < 0)
++		return ~0UL;
++	if ((unsigned long)avail_kb << 10 <= floor_b)
++		return 0;
++	return ((unsigned long)avail_kb << 10) - floor_b;
++}
++
++/*
++ * Can a new arena commit @init bytes now? Tier 1 takes them from the
++ * hugetlb pool (never for an inherited arena, and only on the huge-page
++ * grid); tiers 2-4 take them from general RAM, which must stay above the
++ * floor. Logs why not, for @what, and returns 0; 1 when it fits.
++ */
++static int hg_init_fits(const char *what, unsigned long init,
++		unsigned long cap, int inherited)
++{
++	unsigned long apage = hg_arena_page(init, cap);
++	int huge_grid = (apage == HG_HPS);
++	/* an INIT under one huge page may be raised to one on huge pages */
++	unsigned long need = hg_page_round(init, huge_grid ? HG_HPS : apage);
++	unsigned long room = hg_ram_room(), pool;
++
++	if (need <= room)
++		return 1;
++	pool = (huge_grid && !inherited) ? hg_pool_free_bytes() : 0;
++	if (need <= pool)
++		return 1;
++	LM_ERR("%s: committing %lu %s now does not fit - %lu MB of RAM is "
++		"available above the %ld MB floor (hg_ram_floor_mb) and the "
++		"hugetlb pool has %lu MB free. Lower INIT (-m/-M), the number of "
++		"processes, or the floor, or add memory or huge pages.\n", what,
++		HG_SZ_VAL(need), HG_SZ_UNIT(need),
++		room == ~0UL ? 0 : room >> 20, hg_ram_floor(), pool >> 20);
++	return 0;
++}
++
++/*
++ * Before forking one more process (at startup or by the auto-scaler):
++ * can its private arena commit its INIT? A refusal makes the fork fail
++ * cleanly - the auto-scaler logs it and keeps the processes it has -
++ * instead of the child being OOM-killed, or killing a sibling. Logged
++ * once per episode, re-armed when a fork fits again.
++ */
++int hg_fork_fits(void)
++{
++#ifdef PKG_MALLOC
++	static int said;
++
++	if (mem_allocator_pkg != MM_HG_MALLOC &&
++	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
++		return 1;
++	if (hg_ram_room() >= hg_page_round(pkg_mem_size,
++	        hg_arena_page(pkg_mem_size, hg_pkg_cap_bytes) == HG_HPS ?
++	        HG_HPS : HG_SMALL_PAGE) ||
++	    hg_pool_free_bytes() >= hg_page_round(pkg_mem_size, HG_HPS)) {
++		said = 0;
++		return 1;
++	}
++	if (!said) {
++		said = 1;
++		hg_init_fits("new process's pkg arena", pkg_mem_size,
++			hg_pkg_cap_bytes, 0);
++		LM_ERR("not forking more processes until memory frees up\n");
++	}
++	return 0;
++#else
++	return 1;      /* pkg memory is the system malloc */
++#endif
++}
++
++/*
++ * Startup, once the process counts are known and before anything forks:
++ * will every process's private arena fit? Each child commits its own -M
++ * INIT. Simulated against the hugetlb pool first (a child takes its whole
++ * cap from the pool when it can, else its INIT, else general RAM), then
++ * against RAM above the floor. Refuses to start when the processes forked
++ * at startup do not fit; warns when the auto-scaling maximum does not, or
++ * when the caps could never all be met - the per-fork check stops scaling
++ * there instead of the host running out.
++ */
++int hg_capacity_check(unsigned int start_procs, unsigned int max_procs)
++{
++#ifndef PKG_MALLOC
++	return 0;      /* pkg memory is the system malloc */
++#else
++	unsigned long init = pkg_mem_size, cap, capr, initr_huge, initr_ram;
++	unsigned long pool, pool_left, room, ram_start = 0, ram_max = 0;
++	unsigned long total_kb, caps;
++	unsigned int i, children;
++	int huge_grid;
++
++	if (mem_allocator_pkg != MM_HG_MALLOC &&
++	    mem_allocator_pkg != MM_HG_MALLOC_DBG)
++		return 0;
++
++	cap = hg_pkg_cap_bytes > init ? hg_pkg_cap_bytes : init;
++	huge_grid = (hg_arena_page(init, cap) == HG_HPS);
++	capr = hg_page_round(cap, HG_HPS);
++	initr_huge = hg_page_round(init, HG_HPS);
++	initr_ram = hg_page_round(init, huge_grid ? HG_HPS : HG_SMALL_PAGE);
++	pool = pool_left = huge_grid ? hg_pool_free_bytes() : 0;
++	room = hg_ram_room();
++
++	/* the attendant keeps its pre-fork arena; every other process
++	 * creates its own */
++	children = max_procs > 1 ? max_procs - 1 : 0;
++	for (i = 0; i < children; i++) {
++		unsigned long *ram = (i + 1 < start_procs) ? &ram_start : &ram_max;
++
++		if (pool_left >= capr)
++			pool_left -= capr;
++		else if (pool_left >= initr_huge)
++			pool_left -= initr_huge;
++		else
++			*ram += initr_ram;
++	}
++	ram_max += ram_start;
++	LM_INFO("pkg: %u processes at startup, up to %u with auto-scaling, "
++		"-M INIT %lu %s: %lu MB from the hugetlb pool, %lu MB (%lu MB at "
++		"the maximum) from RAM; %ld MB of RAM available above the %ld MB "
++		"floor\n", start_procs, max_procs, HG_SZ_VAL(init),
++		HG_SZ_UNIT(init), (pool - pool_left) >> 20, ram_start >> 20,
++		ram_max >> 20, room == ~0UL ? -1L : (long)(room >> 20),
++		hg_ram_floor());
++
++	if (room != ~0UL && ram_start > room) {
++		LM_ERR("pkg: the %u processes started now need %lu MB of RAM for "
++			"their -M INIT of %lu %s (after %lu MB from the hugetlb "
++			"pool), but %lu MB is available above the %ld MB floor. "
++			"Lower -M INIT or the worker counts, or add memory or huge "
++			"pages.\n", start_procs, ram_start >> 20, HG_SZ_VAL(init),
++			HG_SZ_UNIT(init), (pool - pool_left) >> 20, room >> 20,
++			hg_ram_floor());
++		return -1;
++	}
++	if (room != ~0UL && ram_max > room)
++		LM_WARN("pkg: auto-scaling up to %u processes would need %lu MB "
++			"of RAM for their -M INIT, but %lu MB is available above "
++			"the %ld MB floor - processes beyond what fits will not be "
++			"forked. Lower the scale-up maximums or -M INIT to make "
++			"them all fit.\n", max_procs, ram_max >> 20, room >> 20,
++			hg_ram_floor());
++
++	total_kb = hg_meminfo_kb("MemTotal");
++	caps = (unsigned long)children * cap;
++	if ((mem_allocator_shm == MM_HG_MALLOC ||
++	     mem_allocator_shm == MM_HG_MALLOC_DBG) && shm_block)
++		caps += ((struct hg_block *)shm_block)->hcap;
++	if (total_kb > 0 && caps > ((unsigned long)total_kb << 10))
++		LM_WARN("the -m cap plus -M cap x %u processes is %lu MB, more "
++			"than the host's %ld MB of memory: those caps can never all "
++			"be met, and growth will be refused at the %ld MB floor\n",
++			children, caps >> 20, total_kb >> 10, hg_ram_floor());
++	return 0;
++#endif
++}
++
 +/*
 + * The host-RAM limb of the growth ceiling - see the prototype comment.
 + *
@@ -7336,7 +7554,7 @@ index 0000000000..9351f6ee3f
 + */
 +int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta)
 +{
-+	static long floor_mb = -1;          /* resolved once, per process */
++	long floor_mb;
 +	unsigned long effective = delta, nproc = 1;
 +	long avail_kb;
 +
@@ -7346,17 +7564,7 @@ index 0000000000..9351f6ee3f
 +	if (hb->tier == HG_MEM_HUGETLB)
 +		return 0;
 +
-+	if (floor_mb < 0) {
-+		if (hg_ram_floor_mb > 0) {
-+			floor_mb = hg_ram_floor_mb;      /* hg_ram_floor_mb= config */
-+		} else {
-+			long total_kb = hg_meminfo_kb("MemTotal");
-+
-+			floor_mb = 256;
-+			if (total_kb > 0 && total_kb / 20 / 1024 > floor_mb)
-+				floor_mb = total_kb / 20 / 1024;
-+		}
-+	}
++	floor_mb = hg_ram_floor();
 +
 +	avail_kb = hg_meminfo_kb("MemAvailable");
 +	if (avail_kb < 0)
@@ -8019,6 +8227,10 @@ index 0000000000..9351f6ee3f
 +			HG_SZ_VAL(mv), HG_SZ_UNIT(mv));
 +		return NULL;
 +	}
++	/* the INIT is committed and pinned at once: refuse one the host
++	 * cannot hold rather than let the kernel's OOM killer decide */
++	if (!hg_init_fits(name, size, cap, (flags & HG_INIT_INHERITED) != 0))
++		return NULL;
 +	cap_asked = cap;
 +	base = hg_mem_reserve(size, &cap, &tier, &locked_b, shared,
 +		(flags & HG_INIT_INHERITED) != 0, apage);
@@ -8586,10 +8798,10 @@ index 0000000000..9351f6ee3f
 +#endif /* HG_MALLOC */
 diff --git a/mem/hg_malloc.h b/mem/hg_malloc.h
 new file mode 100644
-index 0000000000..df4846f22a
+index 0000000000..41de3d5a41
 --- /dev/null
 +++ b/mem/hg_malloc.h
-@@ -0,0 +1,1516 @@
+@@ -0,0 +1,1529 @@
 +/*
 + * hugepage-backed slab allocator
 + *
@@ -9615,6 +9827,19 @@ index 0000000000..df4846f22a
 + * hb->lock.
 + */
 +int hg_grow_ram_refused(struct hg_block *hb, unsigned long delta);
++
++/*
++ * Host-memory checks for the private arenas every process creates, so a
++ * process count or an auto-scaler maximum the host cannot hold is refused
++ * or stopped instead of ending in the kernel's OOM killer:
++ * hg_capacity_check() runs once before anything forks - -1 when the
++ * processes started at startup cannot fit (warns for the auto-scaling
++ * maximum and for caps beyond MemTotal); hg_fork_fits() runs before each
++ * fork - 0 means do not fork this one. Both consider the hugetlb pool and
++ * general RAM above the floor.
++ */
++int hg_capacity_check(unsigned int start_procs, unsigned int max_procs);
++int hg_fork_fits(void);
 +
 +/*
 + * Release the backing of [hbase+off, +len) - the shrink primitive, chosen
@@ -12327,7 +12552,7 @@ index 0000000000..4309590b07
 +	NULL         /* reload confirm */
 +};
 diff --git a/pt.c b/pt.c
-index d6f9c828c3..5a454f57a5 100644
+index d6f9c828c3..0d4772c51f 100644
 --- a/pt.c
 +++ b/pt.c
 @@ -33,6 +33,7 @@
@@ -12338,10 +12563,18 @@ index d6f9c828c3..5a454f57a5 100644
  #include "bin_interface.h"
  #include "core_stats.h"
  
-@@ -144,6 +145,16 @@ int init_multi_proc_support(void)
+@@ -144,6 +145,24 @@ int init_multi_proc_support(void)
  	}
  	#endif
  
++#ifdef HG_MALLOC
++	/* every process creates its own pkg arena: refuse a process count
++	 * the host cannot hold before anything forks */
++	if (hg_capacity_check(count_init_child_processes(),
++	        counted_max_processes) != 0)
++		return -1;
++#endif
++
 +	/* HG_MALLOC's per-thread caches are __thread, so only their owner can
 +	 * give them back; this registers the timer that asks each worker to.
 +	 * Here because it must happen PRE-FORK - register_timer() is closed to
@@ -12355,7 +12588,7 @@ index d6f9c828c3..5a454f57a5 100644
  	/* set the pid for the starter process */
  	set_proc_attrs("starter");
  
-@@ -266,6 +277,29 @@ static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
+@@ -266,6 +285,29 @@ static int internal_fork_child_setup(const struct internal_fork_params *ifpp)
  
  	/* free the script if not needed */
  	if (!(ifpp->flags & OSS_PROC_NEEDS_SCRIPT) && sroutes) {
@@ -12385,7 +12618,21 @@ index d6f9c828c3..5a454f57a5 100644
  		free_route_lists(sroutes);
  		sroutes = NULL;
  	}
-@@ -331,6 +365,23 @@ int internal_fork(const struct internal_fork_params *ifpp)
+@@ -295,6 +337,13 @@ int internal_fork(const struct internal_fork_params *ifpp)
+ 		return -1;
+ 	}
+ 
++#ifdef HG_MALLOC
++	/* the child commits its own pkg arena at once: do not fork one the
++	 * host cannot hold (the auto-scaler logs the failure and carries on) */
++	if (!hg_fork_fits())
++		return -1;
++#endif
++
+ 	seed = rand();
+ 
+ 	LM_DBG("forking new process \"%s\" on slot %d\n", ifpp->proc_desc, new_idx);
+@@ -331,6 +380,23 @@ int internal_fork(const struct internal_fork_params *ifpp)
  		const struct internal_fork_handler *cfhp;
  		/* child process */
  		is_main = 0; /* a child is not main process */
@@ -12409,7 +12656,7 @@ index d6f9c828c3..5a454f57a5 100644
  		/* set uid */
  		process_no = new_idx;
  		/* set attributes, pid etc */
-@@ -364,6 +415,65 @@ int internal_fork(const struct internal_fork_params *ifpp)
+@@ -364,6 +430,65 @@ int internal_fork(const struct internal_fork_params *ifpp)
  				child_startup_failed();
  			}
  		}
@@ -12475,7 +12722,7 @@ index d6f9c828c3..5a454f57a5 100644
  		atomic_store(&pt[process_no].startup_result, CHLD_OK);
  		return 0;
  	}else{
-@@ -449,6 +559,9 @@ int count_child_processes(void)
+@@ -449,6 +574,9 @@ int count_child_processes(void)
  	proc_no += timer_count_processes( &extra );
  	proc_extra_no += extra;
  
