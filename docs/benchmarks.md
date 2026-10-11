@@ -79,16 +79,23 @@ Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the diffe
 
 HG_MALLOC alone at 60,000 on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every table on this page.
 
-| tier | OpenSIPS CPU, cores | host idle | UDP drops | INVITE p99 (probe) |
-|---|---|---|---|---|
-| 1 - hugetlb pool | **4.27** | 71% | 0 | **1.9 ms** |
-| 2 - THP by advice | 4.47 | 71% | 0 | 2.3 ms |
-| 3 - THP by collapse | 4.81 | 65% | 0 | 6.6 ms |
-| 4 - plain 4 KB | 4.90 | 67% | 0 | 4.0 ms |
+| tier | OpenSIPS CPU, cores | vs plain 4 KB | host idle | UDP drops | INVITE p99 (probe) | vs plain 4 KB |
+|---|---|---|---|---|---|---|
+| 1 - hugetlb pool | **4.27** | **-13%** | 71% | 0 | **1.9 ms** | **-52%** |
+| 2 - THP by advice | 4.47 | -9% | 71% | 0 | 2.3 ms | -43% |
+| 3 - THP by collapse | 4.69 | -4% | 68% | 0 | 5.8 ms | +43% |
+| 4 - plain 4 KB, what the other allocators use | 4.90 | - | 67% | 0 | 4.0 ms | - |
 
 Huge pages are worth about 13% of the CPU and half the p99 at this rate; on plain 4 KB pages, like the other allocators, HG_MALLOC still needs 4-14% less CPU than they do (5.12-5.69 cores, mpstat run above) and drops nothing.
 
-Tier 3 first ran with the `MADV_COLLAPSE` retrofit inside each grow: 36 ms per 16 MB step instead of about 5 ms, paid by the worker that ran out of memory while others waited for it, and 107,524 UDP drops - all in the first 18 s, while the arena grew from 128 MB to 1.3 GB. Such a step now publishes its pages on 4 KB at once and the maintenance process collapses them afterwards: 0 drops, with all 664 pages collapsed about 38 s into the load. Until then that memory runs on 4 KB pages, which is why the tier 3 row above sits next to tier 4; once collapsed it is the same memory as tier 2.
+Tier 3 grows the arena from 128 MB to 1.6 GB on 4 KB pages during the run and collapses it in the background, so part of its measurement runs on 4 KB pages while pages are being collapsed - hence a p99 above tier 4's; once collapsed it is the same memory as tier 2. It first ran with the `MADV_COLLAPSE` retrofit inside each grow: 36 ms per 16 MB step instead of about 5 ms, paid by the worker that ran out of memory while others waited for it, and 107,524 UDP drops in the first 18 s. Such a step now publishes its pages on 4 KB at once and the maintenance process collapses them, retrying a page the kernel cannot collapse yet. Its per-second budget:
+
+| collapse budget per second | UDP drops | OpenSIPS CPU, cores | INVITE p99 | whole arena on huge pages after | pages retried / left on 4 KB |
+|---|---|---|---|---|---|
+| 50 ms | 0 | 4.82 | 6.5 ms | ~45 s | 2 / 0 |
+| **100 ms (the default)** | **0** | **4.69** | **5.8 ms** | **~25 s** | **0 / 0** |
+| 200 ms | 0 | 4.63 | 6.3 ms | ~15 s | 182 / 0 |
+| 500 ms, first version without retries | 7,034 | 4.53 | 2.7 ms | never - 204 pages left on 4 KB | - |
 
 ## Memory under load
 
