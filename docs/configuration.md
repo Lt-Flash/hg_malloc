@@ -5,8 +5,11 @@
 | option | meaning |
 |---|---|
 | `-a HG_MALLOC` | use HG_MALLOC for shared and private memory (`-s` / `-k` select them separately) |
+| `-a HG_MALLOC_DBG` | the same, recording file, function and line for every allocation, which `mem:pkg_dump` and `mem:shm_dump` print per site |
 | `-m INIT[:CAP]` | shared arena: initial size, and the cap it may grow to |
 | `-M INIT[:CAP]` | private (per-process) arena, same form |
+
+Restart-persistent memory (`-r`) is not served by HG_MALLOC: it lives in a file mapped at a fixed address, and HG_MALLOC reserves its own arenas. With `-a HG_MALLOC` it uses F_MALLOC (F_MALLOC_DBG with `-a HG_MALLOC_DBG`); `-r HG_MALLOC` is refused at startup.
 
 Sizes are MB, or take a `k`/`m`/`g` suffix (either case): `-m 128:1g`, `-M 512k:16m`. Without a cap the arena is fixed.
 
