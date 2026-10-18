@@ -1,6 +1,6 @@
 # Benchmarks
 
-All figures from one OpenSIPS binary built from master plus HG_MALLOC. The allocator is chosen on the command line, so it is the only difference between arms:
+All figures except [Stateful proxy over UDP, TLS and WSS](#stateful-proxy-over-udp-tls-and-wss), which has its own setup, come from one OpenSIPS binary built from master plus HG_MALLOC. The allocator is chosen on the command line, so it is the only difference between arms:
 
 | arm | options |
 |---|---|
@@ -77,7 +77,7 @@ Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the diffe
 
 ## Backing tiers
 
-HG_MALLOC alone at 60,000 on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every table on this page.
+HG_MALLOC alone at 60,000 on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every table of the main [setup](#setup).
 
 | tier | OpenSIPS CPU, cores | vs plain 4 KB | host idle | UDP drops | INVITE p99 (probe) | vs plain 4 KB |
 |---|---|---|---|---|---|---|
@@ -134,6 +134,26 @@ usrloc without a database, registrar, 4 UDP workers. The elastic arena starts at
 With HP_MALLOC more than half the registrations failed: the 4 workers were saturated, and a profile of this test put 81% of their CPU inside `hp_shm_malloc`.
 
 In both HG runs the arena grew from 128 MB to 1,696 MB in 98 steps with no lock stalls; the longest lock hold was 334 us and 971 us, and each grow's commit (up to 7.1 ms) ran with the lock released.
+
+## Stateful proxy over UDP, TLS and WSS
+
+A second setup with its own host and build, HG_MALLOC against F_MALLOC only:
+
+- **Server:** 16-vCPU KVM guest (Xeon E5-2699 v4), Debian 13, kernel 6.12, no hugetlb pool, so HG_MALLOC ran on transparent huge pages (about 940 MB of THP in use under load). OpenSIPS 4.1 built from master plus HG_MALLOC and other pending patches, among them the receive modes of [OpenSIPS PR #4365](https://github.com/OpenSIPS/opensips/pull/4365); one binary, the allocator chosen on the command line: HG_MALLOC `-m 512:4096 -M 64:512`, F_MALLOC `-m 2048 -M 32`.
+- **Load:** a stateful record-routing proxy (tm, rr, `t_relay()` for every request), 8 workers per transport; each call is INVITE / 100 / 180 / 200 / ACK / BYE / 200 through the proxy, from sipp on three hosts. UDP with default socket buffers; TLS and WSS arrive over 24 long-lived connections from OpenSIPS gateways on the client hosts, so handshake cost is not measured.
+- **Method:** 30-second cells, two repetitions; a rate holds when both complete at least 98% of the offered calls with at most 0.1% failed. Ranges cover the three receive modes, `shared` being the current code.
+
+| same rate, F_MALLOC -> HG_MALLOC | UDP 12,000/s | TLS 6,000/s | WSS 5,000/s |
+|---|---|---|---|
+| CPU per call | -25 to -32% | -9 to -11% | -7 to -8% |
+| TCP workers' CPU | - | -18 to -23% | -16 to -21% |
+| syscalls per call | -69 to -72% | -14 to -20% | -10 to -12% |
+| `sched_yield` per call | - | -54 to -69% | -59 to -64% |
+| failed calls | 0.2-0.8% -> 0 | 0 -> 0 | 0 -> 0 |
+
+With default UDP socket buffers the highest sustained rate rises from 10,000 calls/s to 20,000 on the current receive path and 22,000 with PR #4365's `auto` (F_MALLOC: 13,000 at best, with 4 MB buffers). F_MALLOC hits the buffer limit before the CPU limit: at 12,000/s the kernel drops datagrams while its workers are 63-84% busy. Its extra syscalls are `sched_yield` from the shared-memory lock's adaptive wait and grow with load (57 to 92 per call from 5,000 to 12,000/s), while HG_MALLOC's stay at 28-30 per call from 12,000 to 20,000/s: its common path takes no lock. Over TLS and WSS the TCP workers, which run the script, use 16-23% less CPU; TCP main, which does the TLS I/O, is within 3% with either allocator and sets the ceiling (5,000-8,000 calls/s), so there HG_MALLOC lowers the cost per call rather than raising the ceiling.
+
+Full tables, per-syscall counts and the rig: [udp-rx-mode-measurements, section 6](https://github.com/Lt-Flash/opensips/blob/udp-rx-mode-measurements/README.md#6-hg_malloc-vs-f_malloc-data-for-the-hg_malloc-pull-request-4327).
 
 ## Integrity
 

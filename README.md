@@ -5,6 +5,7 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 ## Why
 
 - **Less CPU per call:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second, and about half on a registrar taking 60k registrations per second.
+- **Over TLS and WSS too:** at the same call rate through a stateful proxy, 7-11% less CPU per call (16-23% less in the TCP workers) and 54-69% fewer `sched_yield` calls than F_MALLOC, on transparent huge pages; over UDP with default socket buffers the highest sustained rate rises from 10k to up to 22k calls per second.
 - **No drops under load:** 0 UDP drops and 0 failed calls at 60k cps, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; the workers keep the socket drained.
 - **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k cps HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
 - **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
@@ -12,7 +13,7 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 - **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
-Measured on vanilla OpenSIPS, every allocator from the same binary - see [benchmarks](docs/benchmarks.md). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
+Measured with every allocator from the same binary - vanilla OpenSIPS, and for the TLS and WSS figures a 4.1 build with other pending patches - see [benchmarks](docs/benchmarks.md). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
 
 ## How it works
 
