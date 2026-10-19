@@ -1,6 +1,23 @@
 # Benchmarks
 
-All figures except [Stateful proxy over UDP, TLS and WSS](#stateful-proxy-over-udp-tls-and-wss), which has its own setup, come from one OpenSIPS binary built from master plus HG_MALLOC. The allocator is chosen on the command line, so it is the only difference between arms:
+The figures on this page come from two setups that count different things. On setup A one unit is an INVITE answered by the server itself; on setup B it is a whole call relayed through the server, with more than four times as many datagrams and two transactions. 60,000 per second on setup A and 20,000 per second on setup B are therefore not comparable rates: compare allocators within a table, not rates across setups.
+
+## What was measured where
+
+| | Setup A: INVITEs answered by the server | Setup B: calls relayed by a stateful proxy |
+|---|---|---|
+| one unit | an INVITE answered 486 by tm, its ACK absorbed: one transaction, 3 datagrams (INVITE in, 486 out, ACK in), nothing forwarded | a call relayed to a UAS with record-routing: INVITE / 100 / 180 / 200 / ACK / BYE / 200, two transactions, 6 datagrams in and 7 out |
+| sections | [INVITEs answered by tm](#setup-a-invites-answered-by-tm), [Backing tiers](#backing-tiers), [Memory under load](#memory-under-load), [Registrar](#registrar-under-a-cold-start-12-million-registers-at-60000-per-second) (REGISTERs instead of INVITEs) | [Relayed calls over UDP, TLS and WSS](#setup-b-relayed-calls-over-udp-tls-and-wss) |
+| server | 16-vCPU KVM guest, Xeon E5-2699 v4, Ubuntu 24.04, kernel 6.8, virtio NIC with 16 queues | another 16-vCPU KVM guest, Xeon E5-2699 v4, Debian 13, kernel 6.12, virtio NIC with 16 queues |
+| build | PR #4327 as of 2026-10-11 (`9f140e2d38`: OpenSIPS master plus HG_MALLOC), gcc 13; [Backing tiers](#backing-tiers) used later commits of the PR, see there | an OpenSIPS 4.1 tree: master plus HG_MALLOC and other pending patches, among them the UDP/TCP receive modes of [OpenSIPS PR #4365](https://github.com/OpenSIPS/opensips/pull/4365) |
+| allocators | F_MALLOC, F_PARALLEL_MALLOC, HP_MALLOC, HG_MALLOC | F_MALLOC, HG_MALLOC |
+| HG_MALLOC memory | a hugetlb pool (tier 1), except in [Backing tiers](#backing-tiers) | no hugetlb pool; the shared arena on plain 4 KB pages (the host's THP `shmem_enabled` is `never`), the private arenas on THP |
+| the other allocators' memory | plain 4 KB pages | shared memory on plain 4 KB pages (the same host setting); private memory under the host's THP policy `always` |
+| server socket buffer | 8 MB (32 MB in one table) | 512 KB, the OpenSIPS default, and 8 MB in one table |
+| load | sipp on two other hosts | sipp on three other hosts; for TLS and WSS through an OpenSIPS gateway on each |
+| runs | one 60 s run per point; the registrar two | 30 s cells, two repetitions |
+
+In both setups one binary served every allocator, chosen on the command line, so within a table the allocator is the only difference:
 
 | arm | options |
 |---|---|
@@ -9,21 +26,21 @@ All figures except [Stateful proxy over UDP, TLS and WSS](#stateful-proxy-over-u
 | HP_MALLOC | `-a HP_MALLOC` |
 | HG_MALLOC | `-a HG_MALLOC` |
 
-## Setup
+Setup A in detail:
 
-- **Server:** 16-vCPU KVM guest (Xeon E5-2699 v4), Ubuntu 24.04, gcc 13, kernel 6.8. virtio NIC with 16 queues, 8 MB UDP socket buffers, `maxbuffer` 8 MB, a hugetlb pool large enough for the caps, `LimitMEMLOCK` unlimited. HG_MALLOC ran on that pool (tier 1, shared and private arenas, confirmed from `core:hg_stats`) in every table except [Backing tiers](#backing-tiers); the other allocators do not use huge pages and ran on plain 4 KB pages.
-- **Load:** sipp, up to 60 instances split evenly over two other 16-vCPU hosts with 16-queue NICs on the same LAN, 1,000-2,000 calls per second each.
+- **Server:** 8 MB UDP socket buffers (`rmem`/`wmem` default and max 8 MB, `maxbuffer` 8 MB), a hugetlb pool large enough for the caps, `LimitMEMLOCK` unlimited. HG_MALLOC's tier (shared and private arenas) was confirmed from `core:hg_stats` in every run.
+- **Load:** sipp, up to 60 instances split evenly over two other 16-vCPU hosts with 16-queue NICs on the same LAN, 1,000-2,000 INVITEs per second each.
 - **CPU:** user plus system time of every OpenSIPS process over a fixed window while the load runs.
-- **Latency:** sipp's per-call response times, plus a separate probe sending 100 requests per second and timing each round trip in microseconds.
+- **Latency:** sipp's response times, plus a separate probe sending 100 requests per second (INVITEs; REGISTERs on the registrar) and timing each round trip in microseconds.
 - **Drops:** the kernel's UDP receive-buffer errors on the server.
 
-## Proxy load: INVITE answered by tm
+## Setup A: INVITEs answered by tm
 
-Vanilla config: proto_udp, tm, sl, signaling, sipmsgops; 8 UDP workers; each INVITE answered 486 by tm, ACK absorbed. 60 s per point.
+Vanilla config: proto_udp, tm, sl, signaling, sipmsgops; 8 UDP workers; each INVITE answered 486 by tm, ACK absorbed. 60 s per point. Rates are INVITEs per second.
 
 All four arms measured in one session, `-m 2048 -M 32`; HG_MALLOC elastic `-m 128:2048 -M 16:32`.
 
-| calls/s | | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+| INVITEs/s | | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
 |---|---|---|---|---|---|
 | 20,000 | CPU, cores | 2.40 | 2.30 | 2.25 | **2.04** |
 | | UDP drops | 0 | 0 | 0 | **0** |
@@ -34,22 +51,22 @@ All four arms measured in one session, `-m 2048 -M 32`; HG_MALLOC elastic `-m 12
 | 60,000 | CPU, cores | 8.57 | 8.13 | 5.40 | **4.69** |
 | | UDP drops | 7,701,938 | 3,609,825 | 247,051 | **0** |
 | | INVITE p99 (probe) | 36 ms | 38 ms | 8.4 ms | **3.3 ms** |
-| | failed calls | 508,165 | 122,206 | 0 | **0** |
+| | failed INVITEs (sipp) | 508,165 | 122,206 | 0 | **0** |
 
-Up to 45,000 every call completed in every arm. At 60,000 F_MALLOC ran out of the 2 GB shared memory 16 s into the run (2,022 of 2,048 MB used), and F_PARALLEL_MALLOC ran out in one of its pools after 11 s (1,747 MB used in total); tm could no longer clone requests, calls failed, sipp retransmitted, and all 8 workers saturated. Both also lost 17 probe INVITEs. HP_MALLOC and HG_MALLOC completed every call.
+Up to 45,000 every INVITE was answered in every arm. At 60,000 F_MALLOC ran out of the 2 GB shared memory 16 s into the run (2,022 of 2,048 MB used), and F_PARALLEL_MALLOC ran out in one of its pools after 11 s (1,747 MB used in total); tm could no longer clone requests, INVITEs failed, sipp retransmitted, and all 8 workers saturated. Both also lost 17 probe INVITEs. HP_MALLOC and HG_MALLOC answered every INVITE.
 
 The elastic arena grew from 128 MB to 528 MB, 1,136 MB and 1,536 MB at the three rates. The longest arena-lock hold was 550 us, 1,363 us and 1,143 us; 1 hold at 45,000 and 4 at 60,000 went over the 1 ms stall threshold.
 
 The 60,000 point again with `-m 4096 -M 32` (HG_MALLOC `-m 128:4096 -M 16:32`), so that no arm runs out of memory:
 
-| calls/s | | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+| INVITEs/s | | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
 |---|---|---|---|---|---|
 | 60,000 | CPU, cores | 5.98 | 5.43 | 6.31 | **4.59** |
 | | UDP drops | 1,119,613 | 4,554 | 363,419 | **0** |
 | | INVITE p99 (probe) | 13.8 ms | 6.5 ms | 13.4 ms | **1.9 ms** |
-| | failed calls | 4,412 | 0 | 0 | **0** |
+| | failed INVITEs (sipp) | 4,412 | 0 | 0 | **0** |
 
-No arm logged a memory error. F_MALLOC peaked at 2,467 MB, more than the 2 GB of the first run, and still failed 4,412 calls whose retransmissions were all dropped; HP_MALLOC's slowest probe INVITE took 1.3 s. HG_MALLOC grew to the same 1,536 MB as with the 2 GB cap, with no lock stall (longest hold 873 us); one client host retransmitted 8,485 times, and six probe INVITEs got their answer only from tm's reply retransmission 500 ms later, with no drop and no send error on the server.
+No arm logged a memory error. F_MALLOC peaked at 2,467 MB, more than the 2 GB of the first run, and still failed 4,412 INVITEs whose retransmissions were all dropped; HP_MALLOC's slowest probe INVITE took 1.3 s. HG_MALLOC grew to the same 1,536 MB as with the 2 GB cap, with no lock stall (longest hold 873 us); one client host retransmitted 8,485 times, and six probe INVITEs got their answer only from tm's reply retransmission 500 ms later, with no drop and no send error on the server.
 
 The same point once more with the host's CPU sampled by `mpstat` on the server over the measurement window, to see whether the drops come from a lack of CPU:
 
@@ -77,7 +94,7 @@ Four times the buffer does not stop F_MALLOC's and HP_MALLOC's drops - the diffe
 
 ## Backing tiers
 
-HG_MALLOC alone at 60,000 on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every table of the main [setup](#setup).
+Setup A. HG_MALLOC alone at 60,000 INVITEs/s on each of the four tiers, the host set up for one tier at a time (hugetlb pool; no pool and THP `advise`; the same with the advice skipped, so pages fault as 4 KB and are collapsed afterwards; no pool and THP `never`), the tier confirmed from the startup log and `core:hg_stats`. `-m 128:4096 -M 16:32`, 8 MB buffers; the other allocators ran on plain 4 KB pages in every setup A table. These runs used later commits of the PR from the same night - `6bd3352a09`, and for the tier-3 row and the budget table the commits that added the deferred collapse (`6642c73b70`, then `0c21c59eab` with retries) - built with a test-only switch that skips `MADV_HUGEPAGE` so that the host could be held on tier 3; the switch is not in the PR.
 
 | tier | OpenSIPS CPU, cores | vs plain 4 KB | host idle | UDP drops | INVITE p99 (probe) | vs plain 4 KB |
 |---|---|---|---|---|---|---|
@@ -99,9 +116,9 @@ Tier 3 grows the arena from 128 MB to 1.6 GB on 4 KB pages during the run and co
 
 ## Memory under load
 
-Peak shared memory in the INVITE runs above, with the UDP drops of the same run:
+Setup A. Peak shared memory in the INVITE runs above, with the UDP drops of the same run:
 
-| calls/s | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
+| INVITEs/s | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC |
 |---|---|---|---|---|
 | 20,000 | 445 MB (0 drops) | 479 MB (0) | 449 MB (0) | **502 MB (0)** |
 | 45,000 | 1,051 MB (31,030) | 1,038 MB (167) | 1,009 MB (19,342) | **1,118 MB (0)** |
@@ -116,7 +133,7 @@ HG_MALLOC's figure is its peak carved memory (`carved_peak` in `core:hg_stats`),
 
 ## Registrar under a cold start: 1.2 million REGISTERs at 60,000 per second
 
-usrloc without a database, registrar, 4 UDP workers. The elastic arena starts at 128 MB and has to grow to hold every registration.
+Setup A, with REGISTERs instead of INVITEs: usrloc without a database, registrar, 4 UDP workers, each REGISTER answered 200 by the server. The elastic arena starts at 128 MB and has to grow to hold every registration.
 
 | | F_MALLOC | F_PARALLEL_MALLOC | HP_MALLOC | HG_MALLOC `-m 128:4096` |
 |---|---|---|---|---|
@@ -135,13 +152,15 @@ With HP_MALLOC more than half the registrations failed: the 4 workers were satur
 
 In both HG runs the arena grew from 128 MB to 1,696 MB in 98 steps with no lock stalls; the longest lock hold was 334 us and 971 us, and each grow's commit (up to 7.1 ms) ran with the lock released.
 
-## Stateful proxy over UDP, TLS and WSS
+## Setup B: relayed calls over UDP, TLS and WSS
 
-A second setup with its own host and build, HG_MALLOC against F_MALLOC only:
+HG_MALLOC against F_MALLOC only. Rates are relayed calls per second (13 datagrams each), not comparable with the INVITE rates of setup A.
 
-- **Server:** 16-vCPU KVM guest (Xeon E5-2699 v4), Debian 13, kernel 6.12, no hugetlb pool, so HG_MALLOC ran on transparent huge pages (about 940 MB of THP in use under load). OpenSIPS 4.1 built from master plus HG_MALLOC and other pending patches, among them the receive modes of [OpenSIPS PR #4365](https://github.com/OpenSIPS/opensips/pull/4365); one binary, the allocator chosen on the command line: HG_MALLOC `-m 512:4096 -M 64:512`, F_MALLOC `-m 2048 -M 32`.
-- **Load:** a stateful record-routing proxy (tm, rr, `t_relay()` for every request), 8 workers per transport; each call is INVITE / 100 / 180 / 200 / ACK / BYE / 200 through the proxy, from sipp on three hosts. UDP with default socket buffers; TLS and WSS arrive over 24 long-lived connections from OpenSIPS gateways on the client hosts, so handshake cost is not measured.
-- **Method:** 30-second cells, two repetitions; a rate holds when both complete at least 98% of the offered calls with at most 0.1% failed. Ranges cover the three receive modes, `shared` being the current code.
+- **Proxy:** stateful and record-routing (tm, rr, `t_relay()` for every request), 8 workers per transport, `log_level=1`. HG_MALLOC `-m 512:4096 -M 64:512`, F_MALLOC `-m 2048 -M 32`. HG_MALLOC's startup log on this host names the tiers: the shared arena on plain 4 KB pages, because the host's `shmem_enabled` is `never`, and every private arena on THP; so both allocators kept their shared memory on 4 KB pages.
+- **Load:** sipp on three hosts, four UAC/UAS pairs each, every call relayed to a UAS on the caller's host. TLS and WSS arrive over 24 long-lived connections from an OpenSIPS gateway on each client host, so TLS handshake cost is not measured.
+- **Method:** 30-second cells, two repetitions per rate in each of the three receive modes of PR #4365 (`shared` being the current code), the server restarted for every cell. A rate holds when both repetitions complete at least 98% of the offered calls with at most 0.1% failed. Ranges below cover the three modes. Drops are the kernel's UDP receive-buffer errors on the server.
+
+### Same rate, 512 KB socket buffer
 
 | same rate, F_MALLOC -> HG_MALLOC | UDP 12,000/s | TLS 6,000/s | WSS 5,000/s |
 |---|---|---|---|
@@ -151,7 +170,21 @@ A second setup with its own host and build, HG_MALLOC against F_MALLOC only:
 | `sched_yield` per call | - | -54 to -69% | -59 to -64% |
 | failed calls | 0.2-0.8% -> 0 | 0 -> 0 | 0 -> 0 |
 
-With default UDP socket buffers the highest sustained rate rises from 10,000 calls/s to 20,000 on the current receive path and 22,000 with PR #4365's `auto` (F_MALLOC: 13,000 at best, with 4 MB buffers). F_MALLOC hits the buffer limit before the CPU limit: at 12,000/s the kernel drops datagrams while its workers are 63-84% busy. Its extra syscalls are `sched_yield` from the shared-memory lock's adaptive wait and grow with load (57 to 92 per call from 5,000 to 12,000/s), while HG_MALLOC's stay at 28-30 per call from 12,000 to 20,000/s: its common path takes no lock. Over TLS and WSS the TCP workers, which run the script, use 16-23% less CPU; TCP main, which does the TLS I/O, is within 3% with either allocator and sets the ceiling (5,000-8,000 calls/s), so there HG_MALLOC lowers the cost per call rather than raising the ceiling.
+With the default 512 KB socket buffer the highest sustained rate rises from 10,000 relayed calls/s to 20,000 on the current receive path and 22,000 with PR #4365's `auto` (F_MALLOC: 13,000 at best, with an 8 MB socket buffer). F_MALLOC hits the buffer limit before the CPU limit: at 12,000/s the kernel drops datagrams while its workers are 63-84% busy. Its extra syscalls are `sched_yield` from the shared-memory lock's adaptive wait and grow with load (57 to 92 per call from 5,000 to 12,000/s), while HG_MALLOC's stay at 28-30 per call from 12,000 to 20,000/s: its common path takes no lock. Over TLS and WSS the TCP workers, which run the script, use 16-23% less CPU; TCP main, which does the TLS I/O, is within 3% with either allocator and sets the ceiling (5,000-8,000 calls/s), so there HG_MALLOC lowers the cost per call rather than raising the ceiling.
+
+### UDP drops with an 8 MB socket buffer
+
+The same proxy with the socket buffer of setup A, to see whether HG_MALLOC's zero drops hold for relayed calls. Measured on 2026-10-19: `maxbuffer` 4 MB, which the kernel doubles to 8 MB, read back from the live socket in every cell; drops counted over the whole cell; six cells per rate (three receive modes, two repetitions); one binary for both allocators.
+
+| relayed calls/s | HG_MALLOC cells without a drop | drops per cell | failed calls per cell |
+|---|---|---|---|
+| 12,000 | 6 of 6 | 0 | 0 |
+| 16,000 | 6 of 6 | 0 | 0 |
+| 18,000 | 3 of 6 | 0-6,661 | 0 |
+| 20,000 | 0 of 6 | 793-42,174 | 0 |
+| 22,000 | 0 of 6 | 51,303-221,282 | 2-667; one cell completed 92% of its calls |
+
+In the same run F_MALLOC with the same 8 MB buffer dropped 57,198 and 230,321 datagrams at 12,000/s (`shared`; 0 and 1,525 failed calls), and HG_MALLOC with the default 512 KB buffer dropped 9,827 (0 failed). With 8 MB, HG_MALLOC drops nothing up to 16,000 relayed calls/s (about 96,000 datagrams in per second) and starts to drop at 18,000, where F_MALLOC already drops at 12,000; up to 20,000 the retransmissions recover every drop.
 
 Full tables, per-syscall counts and the rig: [udp-rx-mode-measurements, section 6](https://github.com/Lt-Flash/opensips/blob/udp-rx-mode-measurements/README.md#6-hg_malloc-vs-f_malloc-data-for-the-hg_malloc-pull-request-4327).
 

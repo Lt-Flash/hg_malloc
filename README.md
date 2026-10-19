@@ -4,16 +4,16 @@ A memory allocator for [OpenSIPS](https://github.com/OpenSIPS/opensips), for bot
 
 ## Why
 
-- **Less CPU per call:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k calls per second, and about half on a registrar taking 60k registrations per second.
-- **Over TLS and WSS too:** at the same call rate through a stateful proxy, 7-11% less CPU per call (16-23% less in the TCP workers) and 54-69% fewer `sched_yield` calls than F_MALLOC, on transparent huge pages; over UDP with default socket buffers the highest sustained rate rises from 10k to up to 22k calls per second.
-- **No drops under load:** 0 UDP drops and 0 failed calls at 60k cps, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; the workers keep the socket drained.
-- **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k cps HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
+- **Less CPU:** 9-27% less than F_MALLOC, F_PARALLEL_MALLOC and HP_MALLOC for the whole server at 20k-60k INVITEs per second answered by tm, and about half on a registrar taking 60k registrations per second.
+- **Over TLS and WSS too:** at the same rate of calls relayed by a stateful proxy, 7-11% less CPU per call (16-23% less in the TCP workers) and 54-69% fewer `sched_yield` calls than F_MALLOC, with HG_MALLOC's shared arena on plain 4 KB pages like F_MALLOC's; over UDP with the default 512 KB socket buffer the highest sustained rate rises from 10k to up to 22k relayed calls per second.
+- **No drops under load:** with 8 MB socket buffers, 0 UDP drops and 0 failed INVITEs at 60k INVITEs/s, where the other allocators drop thousands to millions of datagrams and, with a 2 GB arena, F_MALLOC and F_PARALLEL_MALLOC run out of memory; and 0 drops up to 16k relayed calls/s, where F_MALLOC already drops at 12k. The workers keep the socket drained.
+- **Less memory under overload:** with no drops, transactions are released on time instead of waiting in memory for retransmissions - at 60k INVITEs/s HG_MALLOC peaked at 1.5 GB against 2.0-2.5 GB for HP_MALLOC and F_MALLOC, and stayed within a 2 GB arena that F_MALLOC and F_PARALLEL_MALLOC ran out of.
 - **Tight latency:** 1.2 million registrations at 60k per second with a p99 of 4 ms, against 15-28 s for the others.
 - **No more guessing `-m`:** `-m 128:1024` starts at 128 MB, grows as traffic arrives, and gives memory back when it goes quiet.
 - **Safe and observable:** double frees that reach the shared pool and corrupted free-list links are caught and counted instead of followed; every grow, shrink and lock hold is visible through MI, statistics and events.
 - **Runs anywhere:** huge pages when the host has them, plain 4 KB pages when it does not; builds on x86 and ARM, 32-bit and 64-bit, glibc and musl.
 
-Measured with every allocator from the same binary - vanilla OpenSIPS, and for the TLS and WSS figures a 4.1 build with other pending patches - see [benchmarks](docs/benchmarks.md). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
+Two benchmark setups, each running every allocator from one binary: INVITEs answered by tm on master plus HG_MALLOC (setup A, rates in INVITEs/s), and calls relayed by a stateful proxy over UDP, TLS and WSS on a 4.1 build with other pending patches (setup B, rates in relayed calls/s, 13 datagrams each). Their rates do not compare with each other - see [what was measured where](docs/benchmarks.md#what-was-measured-where). In production since August 2026, now on 19 SIP nodes: billing gateways and load balancers since August, SBCs and registrars since October.
 
 ## How it works
 
@@ -94,7 +94,7 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Costs
 
-- Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations, 5-13% on tm's 1-4 KB objects at rates with no drops. Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
+- Memory per object: a little more than the other allocators, from size-class rounding - +2% live memory on 400k registrations (usrloc insert-only, measured in September 2026 on an earlier HG_MALLOC build), 5-13% on tm's 1-4 KB objects at rates with no drops (setup A). Under overload the total is lower: see [memory under load](docs/benchmarks.md#memory-under-load).
 - The committed arena is pinned, so it shows as resident from the start.
 - The huge-page tiers are Linux-only; elsewhere the arena is plain pinned memory.
 
