@@ -1,3 +1,5 @@
+> **Moved** to [Lt-Flash/opensips, branch `hg_malloc`](https://github.com/Lt-Flash/opensips/blob/hg_malloc/docs/configuration.md); this copy is archived and no longer updated.
+
 # Configuration
 
 ## Command line

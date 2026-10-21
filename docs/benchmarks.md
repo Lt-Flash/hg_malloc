@@ -1,3 +1,5 @@
+> **Moved** to [Lt-Flash/opensips, branch `hg_malloc`](https://github.com/Lt-Flash/opensips/blob/hg_malloc/docs/benchmarks.md); this copy is archived and no longer updated.
+
 # Benchmarks
 
 The figures on this page come from two setups that count different things. On setup A one unit is an INVITE answered by the server itself; on setup B it is a whole call relayed through the server, with more than four times as many datagrams and two transactions. 60,000 per second on setup A and 20,000 per second on setup B are therefore not comparable rates: compare allocators within a table, not rates across setups.

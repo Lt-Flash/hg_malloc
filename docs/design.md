@@ -1,3 +1,5 @@
+> **Moved** to [Lt-Flash/opensips, branch `hg_malloc`](https://github.com/Lt-Flash/opensips/blob/hg_malloc/docs/design.md); this copy is archived and no longer updated.
+
 # HG_MALLOC design
 
 How HG_MALLOC works, what it guarantees, and how to run and monitor it. For the configuration reference see [configuration.md](configuration.md); for measurements, [benchmarks.md](benchmarks.md).
