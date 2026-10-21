@@ -27,18 +27,31 @@ The full design, with measurements behind each decision: [docs/design.md](docs/d
 
 ## Code
 
-- **Branch:** [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) on the Lt-Flash/opensips fork - current OpenSIPS master plus one commit; clone and build it as any OpenSIPS tree. Proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327).
-- **Patch:** [`patches/`](patches) - the same commit as `git format-patch` output, against OpenSIPS master [`6832fe4e66`](https://github.com/OpenSIPS/opensips/commit/6832fe4e66): the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build.
+Everything lives in the [Lt-Flash/opensips](https://github.com/Lt-Flash/opensips) fork:
+
+| branch | what |
+|---|---|
+| [`feature/hg-malloc-v3-final`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-final) | OpenSIPS master (as of 2026-10-09) plus one commit; proposed upstream as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327) |
+| [`feature/hg-malloc-v3-4.0`](https://github.com/Lt-Flash/opensips/tree/feature/hg-malloc-v3-4.0) | the same commit on the 4.0 branch; also applies to the 4.0.1 and 4.0.2 releases |
+| [`hg_malloc`](https://github.com/Lt-Flash/opensips/tree/hg_malloc) | this documentation |
+
+The commit adds the allocator (`mem/hg_*`), elastic-arena and autoscaling configuration, MI commands, statistics and events, and `modules/hgstress`, a soak and fault-injection test module excluded from the default build. Clone a branch and build it as any OpenSIPS tree, or add the commit to an existing tree:
 
 ```bash
-git clone https://github.com/OpenSIPS/opensips && cd opensips
-git checkout 6832fe4e66
-git am /path/to/hg_malloc/patches/0001-*.patch
+git remote add lt-flash https://github.com/Lt-Flash/opensips.git
+git fetch lt-flash feature/hg-malloc-v3-final    # feature/hg-malloc-v3-4.0 for a 4.0 tree
+git cherry-pick FETCH_HEAD
+```
+
+In an unpacked 4.0.x release tarball:
+
+```bash
+curl -L https://github.com/Lt-Flash/opensips/commit/be2e5d9018a982fc8439b7c6419256ab119f6d7f.patch | patch -p1
 ```
 
 ## Quick start
 
-Build: `HG_MALLOC` is in the `DEFS` of `Makefile.conf.template`; it is compiled in next to the other allocators and only used when selected.
+Build: `HG_MALLOC` is in the `DEFS` of `Makefile.conf.template`; it is compiled in next to the other allocators and only used when selected. A tree that already has a `Makefile.conf` needs `DEFS+= -DHG_MALLOC` added to it.
 
 ```bash
 # fixed 512 MB shared arena, 16 MB private arena per process
@@ -100,4 +113,4 @@ Events: `E_CORE_SHM_GROW_BLOCKED` (growth refused for a sustained period), `E_CO
 
 ## Status
 
-Not yet in upstream OpenSIPS. Proposed as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327); available as a branch and as a patch (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.
+Not yet in upstream OpenSIPS. Proposed as [OpenSIPS/opensips#4327](https://github.com/OpenSIPS/opensips/pull/4327); available as branches for master and 4.0 (see [Code](#code)). Licensed under the GNU GPL v2 or later, like OpenSIPS.
